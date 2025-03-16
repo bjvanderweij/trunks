@@ -199,6 +199,18 @@ def create_or_update_branches(tree: dict[str, Branch]):
             click.echo(f"\t{commit.short_str}")
 
 
+class _BranchCommand(typing.NamedTuple):
+    label: str
+    target_label: None | str
+    commit_sha: str
+
+
+class _CommitList(typing.NamedTuple):
+    label: str
+    target_label: None | str
+    commits: list[Commit]
+
+
 def iterate_plan(plan: str):
     """Iterate through lines, skipping empty lines or comments."""
     for line in plan.split("\n"):
@@ -207,7 +219,44 @@ def iterate_plan(plan: str):
         yield line
 
 
-def parse_plan(plan: str) -> dict[str, Branch]:
+def _tokenize_plan(plan: str) -> typing.Iterable[_BranchCommand]:
+    for line in iterate_plan(plan):
+        try:
+            command, sha, *_ = line.split()
+        except ValueError:
+            raise ParsingError("each line should contain at least a command and a commit SHA")
+        if command.startswith("b"):
+            m = re.match(r"(b[0-9]*)(@(b[0-9]*))?$", command)
+            if not m:
+                raise ParsingError(f"unrecognized command: {command}")
+            label, _, target = m.groups()
+            yield _BranchCommand(label, target, sha)
+        elif command != "s":
+            raise ParsingError(f"unrecognized command: {command}")
+
+
+def _make_commit_lists(branch_commands: typing.Iterable[_BranchCommand]) -> list[_CommitList]:
+    """Build lists of contiguous commits belonging to a branch."""
+    branches: list[_CommitList] = []
+    local_commits = iter(get_local_commits())
+    for bc in branch_commands:
+        if len(branches) == 0 or bc.label != branches[-1].label:
+            branches.append(_CommitList(bc.label, None, []))
+        try:
+            commit = next(c for c in local_commits if c.sha.startswith(bc.commit_sha))
+        except StopIteration:
+            raise PlanError("commits are not ordered correctly or unrecognized commit")
+        branches[-1].commits.append(commit)
+        if bc.target_label is not None:
+            if branches[-1].target_label is None:
+                branch = branches.pop(-1)
+                branches.append(branch._replace(target_label=bc.target_label))
+            elif branches[-1].target_label != bc.target_label:
+                raise PlanError(f"multiple targets specified for {branches[-1].label}")
+    return branches
+
+
+def _build_tree(candidate_branches: typing.Iterable[_CommitList]) -> dict[str, Branch]:
     """Parse branching plan and return a branch DAG.
 
     This enforces constraints on the DAG that can be built:
@@ -218,37 +267,29 @@ def parse_plan(plan: str) -> dict[str, Branch]:
     - because the order of commits must be preserved, commits in a branch
       must appear in the same order as the local commits
     """
-    local_commits = iter(get_local_commits())
     branches: dict[str, Branch] = {}
-    valid_targets: set[str] = set()
-    active_target = None
-    for line in iterate_plan(plan):
-        if line.startswith("#") or not line.strip():
-            continue
-        command, sha, *_ = line.split()
-        try:
-            commit = next(c for c in local_commits if c.sha.startswith(sha))
-        except StopIteration:
-            raise PlanError("commits are not ordered correctly or unrecognized commit")
-        if command.startswith("b"):
-            m = re.match(r"(b[0-9]*)(@(b[0-9]*))?$", command)
-            if not m:
-                raise ParsingError(f"unrecognized command: {command}")
-            branch_key, _, target = m.groups()
-            branch = branches.setdefault(branch_key, Branch([], None))
-            if target is not None:
-                if target not in valid_targets:
-                    raise PlanError(f"invalid target for {branch_key}: {target}")
-                if target != active_target:
-                    active_target = target
-                    valid_targets = {active_target}
-                branches[branch_key] = branch._replace(target=branches[target])
-            valid_targets.add(branch_key)
-            branch.commits.append(commit)
-        elif command != "s":
-            raise ParsingError(f"unrecognized command: {command}")
-    tree = {b.name: b for b in branches.values()}
-    return tree
+    last_target_label = None
+    valid_target_labels: set[None | str] = {None}
+    for cb in candidate_branches:
+        if cb.label in branches:
+            raise PlanError("commits in branch must be contiguous")
+        if cb.target_label not in valid_target_labels:
+            raise PlanError(f"invalid target for {cb.label}: {cb.target_label}")
+        target_branch = None
+        if cb.target_label is not None:
+            target_branch = branches[cb.target_label]
+        if cb.target_label != last_target_label:
+            last_target_label = cb.target_label
+            valid_target_labels = {last_target_label}
+        valid_target_labels.add(cb.label)
+        branches[cb.label] = Branch(cb.commits, target_branch)
+    return {b.name: b for b in branches.values()}
+
+
+def parse_plan(plan: str) -> dict[str, Branch]:
+    tokens = _tokenize_plan(plan)
+    commit_lists = _make_commit_lists(tokens)
+    return _build_tree(commit_lists)
 
 
 def generate_plan(tree: dict[str, Branch] | None = None) -> str:
@@ -366,7 +407,20 @@ def update(dry_run: bool):
     if dry_run:
         print(tree)
     else:
-        create_or_update_branches(tree)
+        with utils.preserve_state(auto_stash=AUTO_STASH):
+            try:
+                create_or_update_branches(tree)
+            except CherryPickFailed as exc:
+                pause = click.confirm("cherry-pick failed, pause here and investigate?")
+                if pause:
+                    click.echo("OK, to reset your workspace, run:")
+                    click.echo("git cherry-pick --abort")
+                    raise utils.Pause()
+                else:
+                    utils.run("cherry-pick", "--abort")
+                    utils.run("checkout", "-")
+                    utils.run("branch", "-D", exc.branch.name)
+                raise click.ClickException(f"{exc}")
 
 
 @cli_group.command
@@ -424,13 +478,20 @@ def visualize():
         incoming_edges[branch.name] = [b for b in branches if b.target.name == branch.name]
     for level in range(depth):
         pass
-    # develop <-- b1
-    #         <-- b2 <-- b4
-    #                <-- b5
-    #         <-- b3
+    # develop <-.--b1
+    #           `--b2--.--b4
+    #           `--b3  `--b5
     #
     # b1: <commit> <message>
     # ...
+
+
+@cli_group.command()
+def info():
+    click.echo(f"remote trunk: {REMOTE_TRUNK}")
+    click.echo(f"local trunk: {LOCAL_TRUNK}")
+    click.echo("\nplan:\n")
+    click.echo(generate_plan())
 
 
 @cli_group.command()
@@ -448,6 +509,13 @@ def visualize():
 
 
 @cli_group.command()
+def push_commands():
+    tree = build_tree_from_local_commits()
+    for branch in tree.values():
+        click.echo(f"git checkout {branch.name} && git push -f -u origin {branch.name} && git checkout -")
+
+
+@cli_group.command()
 @click.option(
     "-c",
     "--commits",
@@ -455,7 +523,14 @@ def visualize():
     type=bool,
     help="Print commits in each branch",
 )
-def branches(commits: bool):
+@click.option(
+    "-t",
+    "--target",
+    is_flag=True,
+    type=bool,
+    help="Print target of each branch",
+)
+def branches(commits: bool, target: bool):
     """List active branches.
 
     For all commits between origin/develop and the tip of local develop
@@ -463,7 +538,13 @@ def branches(commits: bool):
     """
     tree = build_tree_from_local_commits()
     for branch in tree.values():
-        click.echo(branch.name)
+        if target:
+            target = REMOTE_TRUNK
+            if branch.target is not None:
+                target = branch.target.name
+            click.echo(f"{branch.name} --> {target}")
+        else:
+            click.echo(branch.name)
         if commits:
             for commit in reversed(branch.commits):
                 click.echo(f"\t{commit.sha[:8]} {commit.message}")
