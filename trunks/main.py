@@ -2,9 +2,9 @@
 
 Concepts:
 
-Remote trunk
-Local trunk
-Difference between local trunk and remote trunk.
+Upstream
+Local
+Difference between local and upstream.
 
 Configuration files:
 
@@ -13,11 +13,12 @@ Configuration files:
 
 Configuration options:
 
-    remote-trunk
-    local-trunk
+    upstream
+    local
     branch-template
 """
 
+import functools
 import typing
 import subprocess
 import tempfile
@@ -29,8 +30,8 @@ import graphviz
 import click
 from trunks import utils
 
-REMOTE_TRUNK = "origin/develop"
-LOCAL_TRUNK = "bastiaan-develop"
+UPSTREAM = "origin/develop"
+LOCAL = "bastiaan-develop"
 BRANCH_TEMPLATE = "feature/{}"
 EDITOR = "vim"
 AUTO_STASH = True
@@ -51,8 +52,47 @@ INSTRUCTIONS = """
 """
 
 
+def no_hot_branch(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if utils.get_current_branch() in _get_hot_branches():
+            raise click.ClickException(
+                "please switch to a branch not managed by trunks before "
+                "continuing"
+            )
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
+def undiverged_trunks(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if utils.have_diverged(UPSTREAM, LOCAL):
+            raise click.ClickException(
+                "your trunks have diverged, rebase local on your upstream"
+            )
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
+def no_unstaged_changes(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        result = utils.run("status", "--porcelain")
+        if bool(result.strip()):
+            raise click.ClickException(
+                "you have unstaged changes, please commit or stash them"
+            )
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
 class TrunksDiverged(Exception):
-    """Raise if local and remote trunks have diverged."""
+    """Raise if local and upstream have diverged."""
+
     pass
 
 
@@ -65,9 +105,7 @@ class ParsingError(Exception):
 
 
 class CherryPickFailed(Exception):
-    def __init__(self, *args, branch, **kwargs):
-        self.branch = branch
-        super().__init__(*args, **kwargs)
+    pass
 
 
 class Commit(typing.NamedTuple):
@@ -87,7 +125,7 @@ class Commit(typing.NamedTuple):
     @property
     def branch_name(self):
         uniqueish = md5(self.message.encode()).hexdigest()[:8]
-        readable = '-'.join(self.message.lower().split()[:4])
+        readable = "-".join(self.message.lower().split()[:4])
         return BRANCH_TEMPLATE.format(f"{readable}-{uniqueish}")
 
 
@@ -98,6 +136,28 @@ class Branch(typing.NamedTuple):
     @property
     def name(self):
         return self.commits[-1].branch_name
+
+    @property
+    def full_name(self):
+        return f"refs/heads/{self.name}"
+
+    def get_force_push_command(
+        self, remote: str, gitlab_merge_request: bool = False
+    ):
+        command = [
+            "push",
+            "--force",
+            f"--set-upstream {remote}",
+            f"{self.full_name}:{self.fullname}",
+        ]
+        if gitlab_merge_request:
+            command += ["--push-option", "merge_request.create"]
+            if self.target is not None:
+                command += [
+                    "--push-option",
+                    "merge_request.target={self.target.name}",
+                ]
+        return command
 
     def exists(self):
         return self.name in utils.get_local_branches()
@@ -126,7 +186,11 @@ def build_tree_from_local_commits(update_commits=False) -> dict[str, Branch]:
     for i, commit in enumerate(commits):
         if commit.branch_name in local_branches:
             preceding_commits = get_last_n_commits(commit.branch_name, i)
-            assert preceding_commits[-1].branch_name == commit.branch_name
+            assert preceding_commits[-1].branch_name == commit.branch_name, (
+                "inconsistent state: trunks-managed branch name "
+                f"{commit.branch_name} does not match branch name expected "
+                "based on its last commit"
+            )
             target_branch = None
             branch_commits: list[Commit] = []
             for preceding_commit in reversed(preceding_commits):
@@ -136,7 +200,9 @@ def build_tree_from_local_commits(update_commits=False) -> dict[str, Branch]:
                     break
                 elif preceding_commit.message in commits_by_message:
                     if update_commits:
-                        branch_commits.insert(0, commits_by_message[preceding_commit.message])
+                        branch_commits.insert(
+                            0, commits_by_message[preceding_commit.message]
+                        )
                     else:
                         branch_commits.insert(0, preceding_commit)
                 else:
@@ -156,18 +222,21 @@ def create_or_update_branches(tree: dict[str, Branch]):
 
     1 check out origin/develop
     2 check if the feature branch exists already, if so, force-delete it
-    3 create a feature branch for the commits (using the name of the first commit)
+    3 create a feature branch for the commits (using the name of the first
+      commit)
     4 cherry-pick the commits
     5 if the cherry-pick fails (as may happen with non-consecutive commits)
         - abort, revert to HEAD, delete the branch, pop stash
-        - allowing fixing this would break the requirement that merge requests are subsets of the local develop
+        - allowing fixing this would break the requirement that merge requests
+          are subsets of the local develop
     5 if successful
         - (optionally) force push to origin (maybe interactive question?)
         - print a message that the branch was created successfully
 
     When reaching a non-root, do pretty much the same:
 
-    - check out the target branch (it must already exist due to topological sorting)
+    - check out the target branch (it must already exist due to topological
+      sorting)
     - do steps 2 to 5
     """
     dag: dict[str, list[str]] = {}
@@ -179,7 +248,7 @@ def create_or_update_branches(tree: dict[str, Branch]):
     ts = TopologicalSorter(dag)
     for branch_name in ts.static_order():
         branch = tree[branch_name]
-        target = REMOTE_TRUNK
+        target = UPSTREAM
         if branch.target is not None:
             target = branch.target.name
         utils.run("checkout", target)
@@ -191,12 +260,24 @@ def create_or_update_branches(tree: dict[str, Branch]):
         try:
             utils.run("cherry-pick", *[c.sha for c in branch.commits])
         except subprocess.CalledProcessError:
-            raise CherryPickFailed("cherry-pick failed at branch {exc.branch.name}", branch=branch)
-        click.echo(
-            f"{action} {branch_name} (target {target}) with commits:"
-        )
+            raise CherryPickFailed(
+                f"Cherry-pick failed at branch {branch.name}."
+            )
+        click.echo(f"{action} {branch_name} (target {target}) with commits:")
         for commit in reversed(branch.commits):
             click.echo(f"\t{commit.short_str}")
+
+
+class _BranchCommand(typing.NamedTuple):
+    label: str
+    target_label: None | str
+    commit_sha: str
+
+
+class _CommitList(typing.NamedTuple):
+    label: str
+    target_label: None | str
+    commits: list[Commit]
 
 
 def iterate_plan(plan: str):
@@ -207,7 +288,56 @@ def iterate_plan(plan: str):
         yield line
 
 
-def parse_plan(plan: str) -> dict[str, Branch]:
+def _tokenize_plan(plan: str) -> typing.Iterable[_BranchCommand]:
+    for line in iterate_plan(plan):
+        try:
+            command, sha, *_ = line.split()
+        except ValueError:
+            raise ParsingError(
+                "each line should contain at least a command and a commit SHA"
+            )
+        if command.startswith("b"):
+            m = re.match(r"(b[0-9]*)(@(b[0-9]*))?$", command)
+            if not m:
+                raise ParsingError(f"unrecognized command: {command}")
+            label, _, target = m.groups()
+            yield _BranchCommand(label, target, sha)
+        elif command != "s":
+            raise ParsingError(f"unrecognized command: {command}")
+
+
+def _make_commit_lists(
+    branch_commands: typing.Iterable[_BranchCommand],
+) -> list[_CommitList]:
+    """Build lists of contiguous commits belonging to a branch."""
+    branches: list[_CommitList] = []
+    local_commits = iter(get_local_commits())
+    for bc in branch_commands:
+        if len(branches) == 0 or bc.label != branches[-1].label:
+            branches.append(_CommitList(bc.label, None, []))
+        try:
+            commit = next(
+                c for c in local_commits if c.sha.startswith(bc.commit_sha)
+            )
+        except StopIteration:
+            raise PlanError(
+                "commits are not ordered correctly or unrecognized commit"
+            )
+        branches[-1].commits.append(commit)
+        if bc.target_label is not None:
+            if branches[-1].target_label is None:
+                branch = branches.pop(-1)
+                branches.append(branch._replace(target_label=bc.target_label))
+            elif branches[-1].target_label != bc.target_label:
+                raise PlanError(
+                    f"multiple targets specified for {branches[-1].label}"
+                )
+    return branches
+
+
+def _build_tree(
+    candidate_branches: typing.Iterable[_CommitList],
+) -> dict[str, Branch]:
     """Parse branching plan and return a branch DAG.
 
     This enforces constraints on the DAG that can be built:
@@ -218,37 +348,31 @@ def parse_plan(plan: str) -> dict[str, Branch]:
     - because the order of commits must be preserved, commits in a branch
       must appear in the same order as the local commits
     """
-    local_commits = iter(get_local_commits())
     branches: dict[str, Branch] = {}
-    valid_targets: set[str] = set()
-    active_target = None
-    for line in iterate_plan(plan):
-        if line.startswith("#") or not line.strip():
-            continue
-        command, sha, *_ = line.split()
-        try:
-            commit = next(c for c in local_commits if c.sha.startswith(sha))
-        except StopIteration:
-            raise PlanError("commits are not ordered correctly or unrecognized commit")
-        if command.startswith("b"):
-            m = re.match(r"(b[0-9]*)(@(b[0-9]*))?$", command)
-            if not m:
-                raise ParsingError(f"unrecognized command: {command}")
-            branch_key, _, target = m.groups()
-            branch = branches.setdefault(branch_key, Branch([], None))
-            if target is not None:
-                if target not in valid_targets:
-                    raise PlanError(f"invalid target for {branch_key}: {target}")
-                if target != active_target:
-                    active_target = target
-                    valid_targets = {active_target}
-                branches[branch_key] = branch._replace(target=branches[target])
-            valid_targets.add(branch_key)
-            branch.commits.append(commit)
-        elif command != "s":
-            raise ParsingError(f"unrecognized command: {command}")
-    tree = {b.name: b for b in branches.values()}
-    return tree
+    last_target_label = None
+    valid_target_labels: set[None | str] = {None}
+    for cb in candidate_branches:
+        if cb.label in branches:
+            raise PlanError("commits in branch must be contiguous")
+        if cb.target_label not in valid_target_labels:
+            raise PlanError(
+                f"invalid target for {cb.label}: {cb.target_label}"
+            )
+        target_branch = None
+        if cb.target_label is not None:
+            target_branch = branches[cb.target_label]
+        if cb.target_label != last_target_label:
+            last_target_label = cb.target_label
+            valid_target_labels = {last_target_label}
+        valid_target_labels.add(cb.label)
+        branches[cb.label] = Branch(cb.commits, target_branch)
+    return {b.name: b for b in branches.values()}
+
+
+def parse_plan(plan: str) -> dict[str, Branch]:
+    tokens = _tokenize_plan(plan)
+    commit_lists = _make_commit_lists(tokens)
+    return _build_tree(commit_lists)
 
 
 def generate_plan(tree: dict[str, Branch] | None = None) -> str:
@@ -273,17 +397,21 @@ def generate_plan(tree: dict[str, Branch] | None = None) -> str:
     for commit in reversed(local_commits):
         new_current_branch = tree.get(commit.branch_name, None)
         if new_current_branch is not None:
-            if current_branch is not None and new_current_branch.name != current_branch.name:
+            if (
+                current_branch is not None
+                and new_current_branch.name != current_branch.name
+            ):
                 branch_index -= 1
                 current_branch = new_current_branch
             if current_branch is None:
                 current_branch = new_current_branch
         command = "s"
-        if current_branch is not None and commit.message in [c.message for c in current_branch.commits]:
-            index_map[current_branch.name] = branch_index
-            command = f"b{branch_index}"
-            if current_branch.target is not None:
-                command += f"@b{current_branch.target.name}"
+        if current_branch is not None:
+            if commit.message in [c.message for c in current_branch.commits]:
+                index_map[current_branch.name] = branch_index
+                command = f"b{branch_index}"
+                if current_branch.target is not None:
+                    command += f"@b{current_branch.target.name}"
         commands.append(command)
     lines = []
     for command, commit in zip(commands, reversed(local_commits)):
@@ -298,7 +426,8 @@ def generate_plan(tree: dict[str, Branch] | None = None) -> str:
 
 def _get_hot_branches() -> set[str]:
     commits = get_local_commits()
-    return set(utils.get_local_branches()) & set(c.branch_name for c in commits)
+    local_branches = utils.get_local_branches()
+    return set(local_branches) & set(c.branch_name for c in commits)
 
 
 def prune_local_branches(tree):
@@ -311,8 +440,15 @@ def prune_local_branches(tree):
 
 def get_commits(rev_a, rev_b):
     """Return commits between rev_a and rev_b in chronological order."""
-    rev_list = utils.run("rev-list", "--no-merges", "--format=oneline", f"{rev_a}..{rev_b}")
-    return [Commit.from_oneline(line) for line in reversed(rev_list.strip().split("\n")) if line]
+    rev_list_output = utils.run(
+        "rev-list",
+        "--no-merges",
+        "--format=oneline",
+        f"{rev_a}..{rev_b}",
+        "--",
+    )
+    rev_list = reversed(rev_list_output.strip().split("\n"))
+    return [Commit.from_oneline(line) for line in rev_list if line]
 
 
 def get_last_n_commits(rev, n) -> list[Commit]:
@@ -321,9 +457,10 @@ def get_last_n_commits(rev, n) -> list[Commit]:
 
 
 def get_local_commits() -> list[Commit]:
-    """Return all commits between remote trunk and local trunk."""
-    commits = get_commits(REMOTE_TRUNK, LOCAL_TRUNK)
-    assert len(commits) == len(set(c.message for c in commits)), "local commit messages must be unique"
+    """Return all commits between upstream and local."""
+    commits = get_commits(UPSTREAM, LOCAL)
+    if len(commits) != len(set(c.message for c in commits)):
+        raise click.ClickException("Local commit messages must be unique.")
     return commits
 
 
@@ -352,56 +489,14 @@ def cli():
         click.echo(exc.stderr)
 
 
-@cli_group.command
-@click.option(
-    "-d",
-    "--dry-run",
-    is_flag=True,
-    type=bool,
-    help="Print the generated tree and don't do anything ",
-)
-def update(dry_run: bool):
-    assert utils.get_current_branch() not in _get_hot_branches()
-    tree = build_tree_from_local_commits(update_commits=True)
-    if dry_run:
-        print(tree)
-    else:
-        create_or_update_branches(tree)
-
-
-@cli_group.command
-def plan():
-    click.echo(generate_plan())
-
-
-@cli_group.command()
-def edit():
-    if utils.get_current_branch() in _get_hot_branches():
-        raise click.ClickException("please switch to a branch not managed by trunks before running")
-    if utils.have_diverged(REMOTE_TRUNK, LOCAL_TRUNK):
-        raise click.ClickException("your trunks have diverged - fix this by rebasing your local trunk on your remote trunk")
-    plan = generate_plan()
-    new_plan = edit_interactively(plan + INSTRUCTIONS)
-    new_plan = "\n".join(iterate_plan(new_plan))
-    if not new_plan.strip() or new_plan.strip() == plan.strip():
-        click.echo("nothing to do")
-        return
-    try:
-        tree = parse_plan(new_plan)
-    except PlanError as exc:
-        click.echo("\n".join(iterate_plan(new_plan)))
-        raise click.ClickException(f"invalid plan: {exc}")
-    except ParsingError as exc:
-        click.echo("\n".join(iterate_plan(new_plan)))
-        raise click.ClickException(f"failed to parse plan: {exc}")
-    validate_tree(tree)
+def update_interactively(tree):
     with utils.preserve_state(auto_stash=AUTO_STASH):
         try:
             create_or_update_branches(tree)
         except CherryPickFailed as exc:
-            pause = click.confirm("cherry-pick failed, pause here and investigate?")
+            pause = click.confirm("{exc}. Pause here and investigate?")
             if pause:
-                click.echo("OK, to reset your workspace, run:")
+                click.echo("OK. To reset your workspace, run:")
                 click.echo("git cherry-pick --abort")
                 raise utils.Pause()
             else:
@@ -412,39 +507,112 @@ def edit():
     prune_local_branches(tree)
 
 
-@cli_group.command()
-def visualize():
-    tree = build_tree_from_local_commits()
-    branches = tree.values()
-    # Find out depth of tree including root node None
-    incoming_edges = {
-        None: [branch for branch in branches() if branch.target is None]
-    }
-    for branch in tree.values():
-        incoming_edges[branch.name] = [b for b in branches if b.target.name == branch.name]
-    for level in range(depth):
-        pass
-    # develop <-- b1
-    #         <-- b2 <-- b4
-    #                <-- b5
-    #         <-- b3
-    #
-    # b1: <commit> <message>
-    # ...
+def update_options(f):
+    click.argument(
+        "remote",
+        nargs=1,
+        default="origin",
+        type=str,
+    )(f)
+    click.option(
+        "-p",
+        "--push",
+        is_flag=True,
+        type=bool,
+        help="Force-push updated branches to remote",
+    )(f)
+    click.option(
+        "-n",
+        "--no-prune",
+        is_flag=True,
+        type=bool,
+        help="Do not prune trunks branches that are not in the plan anymore",
+    )(f)
+    click.option(
+        "-m",
+        "--gitlab-merge-request",
+        is_flag=True,
+        type=bool,
+        help="Use Gitlab-specific push-options to create a merge request",
+    )(f)
+    return f
+
+
+@cli_group.command
+@update_options
+@no_hot_branch
+def update(remote, local, no_prune, gitlab_merge_request):
+    """Create local branches based on the plan."""
+    tree = build_tree_from_local_commits(update_commits=True)
+    _update(tree, remote, local, no_prune, gitlab_merge_request)
+
+
+def _update(tree, remote, local, no_prune, gitlab_merge_request):
+    update_interactively(tree, prune=not no_prune)
+    if not local:
+        for branch in tree.values():
+            push_command = branch.get_force_push_command(
+                remote, gitlab_merge_request=gitlab_merge_request
+            )
+            utils.run(*push_command)
+
+
+@cli_group.command
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    type=bool,
+    help="Print relevant trunks configuration",
+)
+@click.option(
+    "-V",
+    "--visual",
+    is_flag=True,
+    type=bool,
+    help="Render a visual representation of the plan",
+)
+def plan(verbose, visual):
+    """Display the current plan."""
+    if verbose:
+        click.echo(f"upstream: {UPSTREAM}")
+        click.echo(f"local: {LOCAL}\n")
+    if visual:
+        tree = build_tree_from_local_commits()
+        dot = graphviz.Digraph()
+        dot.node(UPSTREAM)
+        for branch in tree.values():
+            dot.node(branch.name)
+            target = UPSTREAM if branch.target is None else branch.target.name
+            dot.edge(branch.name, target)
+        with tempfile.NamedTemporaryFile() as f:
+            dot.render(format="png", filename=f.name, view=True)
+    else:
+        click.echo(generate_plan())
 
 
 @cli_group.command()
-def visualize():
-    """Show a visualization of active branches."""
-    tree = build_tree_from_local_commits()
-    dot = graphviz.Digraph()
-    dot.node(REMOTE_TRUNK)
-    for branch in tree.values():
-        dot.node(branch.name)
-        target = REMOTE_TRUNK if branch.target is None else branch.target.name
-        dot.edge(branch.name, target)
-    with tempfile.NamedTemporaryFile() as f:
-        dot.render(format="png", filename=f.name, view=True)
+@update_options
+@no_hot_branch
+@undiverged_trunks
+def edit(remote, local, no_prune, gitlab_merge_request):
+    """Edit the plan interactively and update local branches."""
+    plan = generate_plan()
+    new_plan = edit_interactively(plan + INSTRUCTIONS)
+    new_plan = "\n".join(iterate_plan(new_plan))
+    if not new_plan.strip() or new_plan.strip() == plan.strip():
+        click.echo("Nothing to do.")
+        return
+    try:
+        tree = parse_plan(new_plan)
+    except PlanError as exc:
+        click.echo("\n".join(iterate_plan(new_plan)))
+        raise click.ClickException(f"invalid plan: {exc}")
+    except ParsingError as exc:
+        click.echo("\n".join(iterate_plan(new_plan)))
+        raise click.ClickException(f"failed to parse plan: {exc}")
+    validate_tree(tree)
+    _update(tree, remote, local, no_prune, gitlab_merge_request)
 
 
 @cli_group.command()
@@ -455,7 +623,14 @@ def visualize():
     type=bool,
     help="Print commits in each branch",
 )
-def branches(commits: bool):
+@click.option(
+    "-t",
+    "--show-targets",
+    is_flag=True,
+    type=bool,
+    help="Print target of each branch",
+)
+def branches(commits: bool, show_targets: bool):
     """List active branches.
 
     For all commits between origin/develop and the tip of local develop
@@ -463,14 +638,13 @@ def branches(commits: bool):
     """
     tree = build_tree_from_local_commits()
     for branch in tree.values():
-        click.echo(branch.name)
+        if show_targets:
+            target = UPSTREAM
+            if branch.target is not None:
+                target = branch.target.name
+            click.echo(f"{branch.name} --> {target}")
+        else:
+            click.echo(branch.name)
         if commits:
             for commit in reversed(branch.commits):
                 click.echo(f"\t{commit.sha[:8]} {commit.message}")
-
-
-@cli_group.command()
-def reorder():
-    """If local commits have been re-ordered by an interactive rebase, try
-    to re-order them using the local tree."""
-    ...

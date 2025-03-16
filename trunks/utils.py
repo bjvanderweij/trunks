@@ -1,12 +1,20 @@
 import subprocess
 import click
+import functools
 from pathlib import Path
 from contextlib import contextmanager
 
 
+class CalledProcessError(subprocess.CalledProcessError):
+    pass
+
+
 def run(*git_action: str, cwd=None):
     # print(" ".join(git_action))
-    result = subprocess.run(["git", *git_action], check=True, capture_output=True, cwd=cwd)
+    try:
+        result = subprocess.run(["git", *git_action], check=True, capture_output=True, cwd=cwd)
+    except subprocess.CalledProcessError as exc:
+        raise click.ClickException(f"subprocess exited with error: {exc.stderr}")
     # print(result.stdout.decode())
     return result.stdout.decode("utf-8")
 
@@ -57,6 +65,9 @@ def preserve_state(auto_stash=False):
     if auto_stash and not work_tree_clean:
         stash = True
     elif not work_tree_clean and not auto_stash:
+        # Git interactive rebase message:
+        # error: cannot rebase: You have unstaged changes.
+        # error: Please commit or stash them.
         raise Exception("work tree not clean")
     pause = False
     if stash:
