@@ -8,18 +8,6 @@ from trunks import utils
 from trunks.main import Branch, Commit, parse_plan, ParsingError, PlanError
 
 
-@pytest.fixture(autouse=True)
-def handle_called_process_issues():
-    try:
-        yield
-    except subprocess.CalledProcessError as exc:
-        print("subprocess failed:")
-        print(exc)
-        print("captured output:")
-        print(exc.output)
-        print(exc.stderr)
-
-
 @pytest.fixture()
 def git_repository():
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -47,7 +35,7 @@ def commit_b(git_repository):
 def commit_c(git_repository):
     with open(git_repository / "c", "w") as f:
         f.write("")
-    utils.run(*("add .".split()))
+    utils.run(*("add c".split()))
     utils.run(*("commit -m c".split()))
 
 
