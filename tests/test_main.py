@@ -35,7 +35,7 @@ def commit_b(git_repository):
 def commit_c(git_repository):
     with open(git_repository / "c", "w") as f:
         f.write("")
-    utils.run(*("add c".split()))
+    utils.run(*("add .".split()))
     utils.run(*("commit -m c".split()))
 
 
@@ -113,7 +113,7 @@ def test_build_tree_from_local_commits():
     pass
 
 
-def test_a(commit_a, commit_c):
+def test_a(commit_a, commit_b, commit_c):
     r = utils.run("log")
     print(r.stdout)
     assert False
