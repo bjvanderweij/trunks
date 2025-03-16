@@ -27,6 +27,7 @@ def commit_a(git_repository):
 def commit_b(git_repository):
     with open(git_repository / "b", "w") as f:
         f.write("")
+    print(list(Path(git_repository).glob("**/*")))
     utils.run(*("add .".split()))
     utils.run(*("commit -m b".split()))
 
