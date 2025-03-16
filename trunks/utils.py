@@ -5,9 +5,9 @@ from contextlib import contextmanager
 
 
 def run(*git_action: str, cwd=None):
-    print(" ".join(git_action))
+    # print(" ".join(git_action))
     result = subprocess.run(["git", *git_action], check=True, capture_output=True, cwd=cwd)
-    print(result.stdout.decode())
+    # print(result.stdout.decode())
     return result.stdout.decode("utf-8")
 
 

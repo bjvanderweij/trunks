@@ -516,6 +516,13 @@ def push_commands():
 
 
 @cli_group.command()
+def merge_requests():
+    tree = build_tree_from_local_commits()
+    for branch in tree.values():
+        click.echo(f"git checkout {branch.name} && git push -f -u origin {branch.name} && git checkout -")
+
+
+@cli_group.command()
 @click.option(
     "-c",
     "--commits",

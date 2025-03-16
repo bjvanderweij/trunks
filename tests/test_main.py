@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 from trunks import utils
-from trunks.main import Branch, Commit, parse_plan, ParsingError, PlanError
+from trunks.main import (
+    Branch, Commit, parse_plan, ParsingError, PlanError, REMOTE_TRUNK, LOCAL_TRUNK
+)
 
 
 @pytest.fixture()
@@ -18,26 +20,40 @@ def git_repository():
 @pytest.fixture()
 def commit_a(git_repository):
     with open(git_repository / "a", "w") as f:
-        f.write("")
-    utils.run(*("add .".split()))
-    utils.run(*("commit -m a".split()))
+        f.write("a")
+    utils.run(*("add a".split()), cwd=git_repository)
+    utils.run(*("commit -m a".split()), cwd=git_repository)
+    return utils.run(*("rev-parse HEAD".split()))
+
+
+@pytest.fixture()
+def remote_trunk(git_repository):
+    utils.run(*(f"checkout -b {REMOTE_TRUNK}".split()), cwd=git_repository)
+    utils.run(*("checkout -".split()), cwd=git_repository)
+
+
+@pytest.fixture()
+def local_trunk(git_repository):
+    utils.run(*(f"checkout -b {LOCAL_TRUNK}".split()), cwd=git_repository)
+    utils.run(*("checkout -".split()), cwd=git_repository)
 
 
 @pytest.fixture()
 def commit_b(git_repository):
     with open(git_repository / "b", "w") as f:
         f.write("")
-    print(list(Path(git_repository).glob("**/*")))
-    utils.run(*("add .".split()))
-    utils.run(*("commit -m b".split()))
+    utils.run(*("add .".split()), cwd=git_repository)
+    utils.run(*("commit -m b".split()), cwd=git_repository)
+    return utils.run(*("rev-parse HEAD".split()))
 
 
 @pytest.fixture()
 def commit_c(git_repository):
     with open(git_repository / "c", "w") as f:
         f.write("")
-    utils.run(*("add .".split()))
-    utils.run(*("commit -m c".split()))
+    utils.run(*("add .".split()), cwd=git_repository)
+    utils.run(*("commit -m c".split()), cwd=git_repository)
+    return utils.run(*("rev-parse HEAD".split()))
 
 
 @pytest.fixture()
@@ -114,7 +130,7 @@ def test_build_tree_from_local_commits():
     pass
 
 
-def test_a(commit_a, commit_b, commit_c):
-    r = utils.run("log")
-    print(r.stdout)
+def test_a(commit_b, remote_trunk, commit_a, commit_c, local_trunk, git_repository):
+    r = utils.run("log", cwd=git_repository)
+    print(r)
     assert False
