@@ -1,10 +1,23 @@
 import tempfile
+import subprocess
 from unittest.mock import patch
 from pathlib import Path
 
 import pytest
 from trunks import utils
 from trunks.main import Branch, Commit, parse_plan, ParsingError, PlanError
+
+
+@pytest.fixture(autouse=True)
+def handle_called_process_issues():
+    try:
+        yield
+    except subprocess.CalledProcessError as exc:
+        print("subprocess failed:")
+        print(exc)
+        print("captured output:")
+        print(exc.output)
+        print(exc.stderr)
 
 
 @pytest.fixture()
