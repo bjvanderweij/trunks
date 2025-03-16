@@ -29,24 +29,24 @@ def git_repository():
 
 @pytest.fixture()
 def commit_a(git_repository):
-    with open(git_repository / "a", "w"):
-        pass
+    with open(git_repository / "a", "w") as f:
+        f.write("")
     utils.run(*("add .".split()))
     utils.run(*("commit -m a".split()))
 
 
 @pytest.fixture()
 def commit_b(git_repository):
-    with open(git_repository / "b", "w"):
-        pass
+    with open(git_repository / "b", "w") as f:
+        f.write("")
     utils.run(*("add .".split()))
     utils.run(*("commit -m b".split()))
 
 
 @pytest.fixture()
 def commit_c(git_repository):
-    with open(git_repository / "c", "w"):
-        pass
+    with open(git_repository / "c", "w") as f:
+        f.write("")
     utils.run(*("add .".split()))
     utils.run(*("commit -m c".split()))
 
