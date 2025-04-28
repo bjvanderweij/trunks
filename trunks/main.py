@@ -23,6 +23,7 @@ import typing
 import subprocess
 import tempfile
 import re
+import sys
 from hashlib import md5
 from graphlib import TopologicalSorter
 
@@ -32,9 +33,11 @@ from trunks import utils
 
 UPSTREAM = "origin/develop"
 LOCAL = "bastiaan-develop"
+# UPSTREAM = "remote"
+# LOCAL = "local"
 BRANCH_TEMPLATE = "feature/{}"
 EDITOR = "vim"
-AUTO_STASH = True
+AUTO_STASH = False
 
 
 INSTRUCTIONS = """
@@ -105,7 +108,8 @@ class ParsingError(Exception):
 
 
 class CherryPickFailed(Exception):
-    pass
+    def __init__(self, *args, branch, **kwargs):
+        self.branch = branch
 
 
 class Commit(typing.NamedTuple):
@@ -141,44 +145,85 @@ class Branch(typing.NamedTuple):
     def full_name(self):
         return f"refs/heads/{self.name}"
 
+    @property
+    def target_name(self):
+        if self.target is None:
+            return UPSTREAM
+        else:
+            return self.target.name
+
+    def exists(self):
+        return utils.object_exists(self.full_name)
+
+    def delete(self):
+        utils.run("branch", "-D", self.name)
+
+    def create(self):
+        utils.checkout("-b", self.name)
+
+    @property
+    def create_instructions(self) -> str:
+        return (
+            f"git checkout {self.target_name}\n"
+            f"git cherry-pick {' '.join([c.sha for c in self.commits])}"
+        )
+
+    def cherry_pick(self):
+        try:
+            utils.run("cherry-pick", *[c.sha for c in self.commits])
+        except subprocess.CalledProcessError:
+            raise CherryPickFailed(
+                f"Cherry-pick failed at branch {self.name}.", branch=self
+            )
+
     def get_force_push_command(
         self, remote: str, gitlab_merge_request: bool = False
     ):
         command = [
             "push",
             "--force",
-            f"--set-upstream {remote}",
-            f"{self.full_name}:{self.fullname}",
+            "--set-upstream",
+            remote,
+            f"{self.full_name}:{self.full_name}",
         ]
         if gitlab_merge_request:
             command += ["--push-option", "merge_request.create"]
             if self.target is not None:
                 command += [
                     "--push-option",
-                    "merge_request.target={self.target.name}",
+                    f"merge_request.target={self.target.name}",
                 ]
         return command
 
-    def exists(self):
-        return self.name in utils.get_local_branches()
+    def __str__(self):
+        return (
+            "Branch {self.name} with commits:"
+            "\n".join(f"\t{c.message}" for c in self.commits)
+        )
 
 
-def validate_tree(tree: dict[str, Branch]):
-    """Validate a branch DAG.
-
-    Actually, it's not a DAG, it's a tree
-
-    All commits in the branch must be consecutive.
-    Following a branch, new branches can only point to that branch, and not
-    branches before it? This one might be optional but it feels necessary.
-
-    There should be no duplicate commit messages
-    """
-    ...
+def get_trunks_branches():
+    local_branches = utils.get_local_branches()
+    commits = get_local_commits()
+    branch_names = [c.branch_name for c in commits]
+    return [b for b in local_branches if b in branch_names]
 
 
-def build_tree_from_local_commits(update_commits=False) -> dict[str, Branch]:
-    """Take the leading commits and rebuild the tree."""
+def make_simple_tree(stack) -> dict[str, Branch]:
+    """Use local commits create a tree of stacked branches."""
+    commits = get_local_commits()
+    tree: dict[str, Branch] = {}
+    target_branch = None
+    for commit in commits:
+        branch = Branch([commit], target_branch)
+        tree[commit.branch_name] = branch
+        if stack:
+            target_branch = branch
+    return tree
+
+
+def reconstruct_tree() -> dict[str, Branch]:
+    """Use local commits to reconstruct the plan."""
     commits = get_local_commits()
     commits_by_message = {c.message: c for c in commits}
     local_branches = utils.get_local_branches()
@@ -186,11 +231,13 @@ def build_tree_from_local_commits(update_commits=False) -> dict[str, Branch]:
     for i, commit in enumerate(commits):
         if commit.branch_name in local_branches:
             preceding_commits = get_last_n_commits(commit.branch_name, i)
-            assert preceding_commits[-1].branch_name == commit.branch_name, (
-                "inconsistent state: trunks-managed branch name "
-                f"{commit.branch_name} does not match branch name expected "
-                "based on its last commit"
-            )
+            if preceding_commits[-1].branch_name != commit.branch_name:
+                raise click.ClickException(
+                    "Invalid state: trunks-managed branch name "
+                    f"{commit.branch_name} does not match branch name "
+                    "expected based on its last commit.\nIf you'd like to "
+                    "start with a clean slate, run `trunks reset`."
+                )
             target_branch = None
             branch_commits: list[Commit] = []
             for preceding_commit in reversed(preceding_commits):
@@ -199,12 +246,9 @@ def build_tree_from_local_commits(update_commits=False) -> dict[str, Branch]:
                     target_branch = tree[preceding_commit.branch_name]
                     break
                 elif preceding_commit.message in commits_by_message:
-                    if update_commits:
-                        branch_commits.insert(
-                            0, commits_by_message[preceding_commit.message]
-                        )
-                    else:
-                        branch_commits.insert(0, preceding_commit)
+                    branch_commits.insert(
+                        0, commits_by_message[preceding_commit.message]
+                    )
                 else:
                     break
             branch = Branch(branch_commits, target_branch)
@@ -213,31 +257,14 @@ def build_tree_from_local_commits(update_commits=False) -> dict[str, Branch]:
 
 
 def create_or_update_branches(tree: dict[str, Branch]):
-    """Sort the tree in topological order.
+    """Create feature branches based on the plan in tree.
 
-    - stash everything (git stash -u)
-    - record HEAD position
+    Start at the roots of the tree and for each branch in the topologically
+    sorted branches, checkout its target (UPSTREAM if None), delete the branch
+    if it already exists, create the branch, cherry-pick its commits.
 
-    Start at the roots of the tree (Branch with None target). For each:
-
-    1 check out origin/develop
-    2 check if the feature branch exists already, if so, force-delete it
-    3 create a feature branch for the commits (using the name of the first
-      commit)
-    4 cherry-pick the commits
-    5 if the cherry-pick fails (as may happen with non-consecutive commits)
-        - abort, revert to HEAD, delete the branch, pop stash
-        - allowing fixing this would break the requirement that merge requests
-          are subsets of the local develop
-    5 if successful
-        - (optionally) force push to origin (maybe interactive question?)
-        - print a message that the branch was created successfully
-
-    When reaching a non-root, do pretty much the same:
-
-    - check out the target branch (it must already exist due to topological
-      sorting)
-    - do steps 2 to 5
+    Return a dictionary that maps each branch name to a boolean that is True
+    only if the branch already existed and was re-created.
     """
     dag: dict[str, list[str]] = {}
     for name, branch in tree.items():
@@ -246,26 +273,25 @@ def create_or_update_branches(tree: dict[str, Branch]):
         if branch.target is not None:
             dag[name].append(branch.target.name)
     ts = TopologicalSorter(dag)
+    updated = {}
     for branch_name in ts.static_order():
         branch = tree[branch_name]
-        target = UPSTREAM
-        if branch.target is not None:
-            target = branch.target.name
-        utils.run("checkout", target)
-        action = "created"
-        if branch.exists():
-            action = "updated"
-            utils.run("branch", "-D", branch.name)
-        utils.run("checkout", "-b", branch.name)
-        try:
-            utils.run("cherry-pick", *[c.sha for c in branch.commits])
-        except subprocess.CalledProcessError:
-            raise CherryPickFailed(
-                f"Cherry-pick failed at branch {branch.name}."
-            )
-        click.echo(f"{action} {branch_name} (target {target}) with commits:")
-        for commit in reversed(branch.commits):
-            click.echo(f"\t{commit.short_str}")
+        utils.checkout(branch.target_name)
+        with utils.temporary_branch():
+            try:
+                branch.cherry_pick()
+            except CherryPickFailed:
+                try:
+                    utils.run("cherry-pick", "--abort")
+                except subprocess.CalledProcessError:
+                    click.echo("Failed to abort cherry-pick.")
+                raise
+            if branch.exists():
+                branch.delete()
+                updated[branch_name] = True
+            branch.create()
+            updated[branch_name] = False
+    return updated
 
 
 class _BranchCommand(typing.NamedTuple):
@@ -375,7 +401,7 @@ def parse_plan(plan: str) -> dict[str, Branch]:
     return _build_tree(commit_lists)
 
 
-def generate_plan(tree: dict[str, Branch] | None = None) -> str:
+def generate_plan(tree: dict[str, Branch]) -> str:
     """Generate merging plan.
 
     Use the commit messages of the local commits to derive branch names
@@ -387,8 +413,6 @@ def generate_plan(tree: dict[str, Branch] | None = None) -> str:
     commits whose sha might differ from the one in the local commits,
     but the commits in the plan correspond to those in the local commits.
     """
-    if tree is None:
-        tree = build_tree_from_local_commits()
     current_branch = None
     branch_index = len(tree)
     index_map: dict[str, int] = {}
@@ -475,7 +499,10 @@ def edit_interactively(contents: str) -> str:
 
 @click.group()
 def cli_group():
-    pass
+    if not utils.object_exists(UPSTREAM):
+        raise click.ClickException(f"Upstream {UPSTREAM} does not exist")
+    if not utils.object_exists(LOCAL):
+        raise click.ClickException(f"Local {LOCAL} does not exist")
 
 
 def cli():
@@ -487,40 +514,12 @@ def cli():
         click.echo("captured output:")
         click.echo(exc.output)
         click.echo(exc.stderr)
+        raise
 
 
-def update_interactively(tree):
-    with utils.preserve_state(auto_stash=AUTO_STASH):
-        try:
-            create_or_update_branches(tree)
-        except CherryPickFailed as exc:
-            pause = click.confirm("{exc}. Pause here and investigate?")
-            if pause:
-                click.echo("OK. To reset your workspace, run:")
-                click.echo("git cherry-pick --abort")
-                raise utils.Pause()
-            else:
-                utils.run("cherry-pick", "--abort")
-                utils.run("checkout", "-")
-                utils.run("branch", "-D", exc.branch.name)
-            raise click.ClickException(f"{exc}")
-    prune_local_branches(tree)
 
 
 def update_options(f):
-    click.argument(
-        "remote",
-        nargs=1,
-        default="origin",
-        type=str,
-    )(f)
-    click.option(
-        "-p",
-        "--push",
-        is_flag=True,
-        type=bool,
-        help="Force-push updated branches to remote",
-    )(f)
     click.option(
         "-n",
         "--no-prune",
@@ -528,33 +527,83 @@ def update_options(f):
         type=bool,
         help="Do not prune trunks branches that are not in the plan anymore",
     )(f)
-    click.option(
-        "-m",
-        "--gitlab-merge-request",
-        is_flag=True,
-        type=bool,
-        help="Use Gitlab-specific push-options to create a merge request",
-    )(f)
     return f
+
+
+@cli_group.command
+@click.argument(
+    "remote",
+    nargs=1,
+    default="origin",
+    type=str,
+)
+@click.option(
+    "-s",
+    "--soft",
+    is_flag=True,
+    type=bool,
+    help="Print the push commands instead of executing them.",
+)
+@click.option(
+    "-i",
+    "--interactive",
+    is_flag=True,
+    type=bool,
+    help="Choose which branches to push.",
+)
+@click.option(
+    "-m",
+    "--gitlab-merge-request",
+    is_flag=True,
+    type=bool,
+    help="Use Gitlab-specific push-options to create a merge request",
+)
+def push(remote, soft, interactive, gitlab_merge_request):
+    tree = reconstruct_tree()
+    for branch in tree.values():
+        push_command = branch.get_force_push_command(
+            remote, gitlab_merge_request=gitlab_merge_request
+        )
+        do_it = True
+        if interactive:
+            do_it = click.confirm(
+                f"Push {branch.name} to {remote}?", default=True
+            )
+        if soft:
+            click.echo(f"git {' '.join(push_command)}")
+        elif do_it:
+            click.echo(f"Pushing {branch.name}.")
+            utils.run(*push_command)
+    if not soft:
+        click.echo("Done.")
 
 
 @cli_group.command
 @update_options
 @no_hot_branch
-def update(remote, local, no_prune, gitlab_merge_request):
-    """Create local branches based on the plan."""
-    tree = build_tree_from_local_commits(update_commits=True)
-    _update(tree, remote, local, no_prune, gitlab_merge_request)
+def update(no_prune):
+    """Infer the plan from local branches and update the commits in the
+    branches.
+    """
+    tree = reconstruct_tree()
+    try:
+        _update(tree, no_prune)
+    except CherryPickFailed as exc:
+        raise click.ClickException(
+            f"{exc}\n\n"
+            f"To investigate, run:\n\n{exc.branch.create_instructions}."
+        )
 
 
-def _update(tree, remote, local, no_prune, gitlab_merge_request):
-    update_interactively(tree, prune=not no_prune)
-    if not local:
-        for branch in tree.values():
-            push_command = branch.get_force_push_command(
-                remote, gitlab_merge_request=gitlab_merge_request
-            )
-            utils.run(*push_command)
+def _update(tree, no_prune):
+    with utils.preserve_state(auto_stash=AUTO_STASH):
+        create_or_update_branches(tree)
+        click.echo(
+            "Branches updated. "
+            "Run `trunks push` to push them to a remote."
+        )
+    if not no_prune:
+        prune_local_branches(tree)
 
 
 @cli_group.command
@@ -572,13 +621,13 @@ def _update(tree, remote, local, no_prune, gitlab_merge_request):
     type=bool,
     help="Render a visual representation of the plan",
 )
-def plan(verbose, visual):
+def show(verbose, visual):
     """Display the current plan."""
     if verbose:
         click.echo(f"upstream: {UPSTREAM}")
         click.echo(f"local: {LOCAL}\n")
     if visual:
-        tree = build_tree_from_local_commits()
+        tree = reconstruct_tree()
         dot = graphviz.Digraph()
         dot.node(UPSTREAM)
         for branch in tree.values():
@@ -588,31 +637,66 @@ def plan(verbose, visual):
         with tempfile.NamedTemporaryFile() as f:
             dot.render(format="png", filename=f.name, view=True)
     else:
-        click.echo(generate_plan())
+        tree = reconstruct_tree()
+        click.echo(generate_plan(tree))
 
 
 @cli_group.command()
+@click.option(
+    "-g",
+    "--generator",
+    type=click.Choice(["detect", "stacked", "independent", "reset"]),
+    default="detect",
+    help="Plan generation strategy."
+)
+@click.option(
+    "-e",
+    "--edit",
+    is_flag=True,
+    type=bool,
+    help="Edit the plan before executing it."
+)
 @update_options
 @no_hot_branch
 @undiverged_trunks
-def edit(remote, local, no_prune, gitlab_merge_request):
-    """Edit the plan interactively and update local branches."""
-    plan = generate_plan()
-    new_plan = edit_interactively(plan + INSTRUCTIONS)
-    new_plan = "\n".join(iterate_plan(new_plan))
-    if not new_plan.strip() or new_plan.strip() == plan.strip():
-        click.echo("Nothing to do.")
-        return
+def plan(generator, edit, no_prune):
+    """Create a plan and update local branches."""
+    old_tree = reconstruct_tree()
+    if generator == "stacked":
+        tree = make_simple_tree(stack=True)
+    elif generator == "independent":
+        tree = make_simple_tree(stack=False)
+    elif generator == "reset":
+        tree = {}
+    elif generator == "detect":
+        tree = old_tree
+    else:
+        assert False, "You, the programmer, missed a case."
+    plan = generate_plan(tree)
+    if edit:
+        new_plan = edit_interactively(plan + INSTRUCTIONS)
+        new_plan = "\n".join(iterate_plan(new_plan))
+        if not new_plan.strip():
+            click.echo("Aborting.")
+            return
+    else:
+        new_plan = plan
+    click.echo(f"The plan:\n\n{new_plan}\n")
     try:
         tree = parse_plan(new_plan)
-    except PlanError as exc:
-        click.echo("\n".join(iterate_plan(new_plan)))
-        raise click.ClickException(f"invalid plan: {exc}")
-    except ParsingError as exc:
-        click.echo("\n".join(iterate_plan(new_plan)))
-        raise click.ClickException(f"failed to parse plan: {exc}")
-    validate_tree(tree)
-    _update(tree, remote, local, no_prune, gitlab_merge_request)
+        if tree == old_tree:
+            click.echo("No updates required.")
+            return
+        update = click.confirm("Update branches accordingly?", default=True)
+        if update:
+            _update(tree, no_prune)
+    except (PlanError, ParsingError) as exc:
+        raise click.ClickException(f"{exc}")
+    except CherryPickFailed as exc:
+        raise click.ClickException(
+            f"{exc} To reproduce the failed cherry-pick, run the following "
+            f"commands:\n\n{exc.branch.create_instructions}"
+        )
 
 
 @cli_group.command()
@@ -636,15 +720,40 @@ def branches(commits: bool, show_targets: bool):
     For all commits between origin/develop and the tip of local develop
     find, feature branches with a branch name derived from that commit.
     """
-    tree = build_tree_from_local_commits()
-    for branch in tree.values():
+    branches = get_trunks_branches()
+    if show_targets or commits:
+        tree = reconstruct_tree()
+    for branch_name in branches:
         if show_targets:
+            branch = tree[branch_name]
             target = UPSTREAM
             if branch.target is not None:
                 target = branch.target.name
-            click.echo(f"{branch.name} --> {target}")
+            click.echo(f"{branch_name} --> {target}")
         else:
-            click.echo(branch.name)
+            click.echo(branch_name)
         if commits:
+            branch = tree[branch_name]
             for commit in reversed(branch.commits):
                 click.echo(f"\t{commit.sha[:8]} {commit.message}")
+
+
+@cli_group.command()
+@click.option(
+    '--yes',
+    is_flag=True,
+)
+def reset(yes):
+    """Remove trunks-managed branches."""
+    branches = get_trunks_branches()
+    if len(branches) == 0:
+        click.echo("No active trunks branches found")
+        return
+    if not yes:
+        click.echo("This will delete the following branches:")
+        for branch_name in branches:
+            click.echo(branch_name)
+        confirmed = click.confirm("Continue?")
+    if confirmed or yes:
+        for branch_name in branches:
+            utils.run("branch", "-D", branch_name)

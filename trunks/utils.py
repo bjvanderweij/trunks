@@ -1,6 +1,6 @@
 import subprocess
 import click
-import functools
+import uuid
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -11,10 +11,12 @@ class CalledProcessError(subprocess.CalledProcessError):
 
 def run(*git_action: str, cwd=None):
     # print(" ".join(git_action))
-    try:
-        result = subprocess.run(["git", *git_action], check=True, capture_output=True, cwd=cwd)
-    except subprocess.CalledProcessError as exc:
-        raise click.ClickException(f"subprocess exited with error: {exc.stderr}")
+    # try:
+    result = subprocess.run(
+        ["git", *git_action], check=True, capture_output=True, cwd=cwd
+    )
+    # except subprocess.CalledProcessError as exc:
+    #     raise Exception(f"subprocess exited with error: {exc.stderr}.")
     # print(result.stdout.decode())
     return result.stdout.decode("utf-8")
 
@@ -24,13 +26,13 @@ def get_local_branches() -> list[str]:
     return result.strip().split("\n")
 
 
-def get_root() -> Path:
+def get_repository_root() -> Path:
     result = run("rev-parse", "--show-toplevel")
     return Path(result.strip())
 
 
 def get_head() -> str:
-    with open(get_root() / ".git" / "HEAD") as f:
+    with open(get_repository_root() / ".git" / "HEAD") as f:
         head = f.read().strip()
     if head.startswith("ref: "):
         ref = head.split()[1]
@@ -39,13 +41,23 @@ def get_head() -> str:
     return head
 
 
-def checkout(ref):
-    run("checkout", ref)
+def object_exists(rev):
+    try:
+        run("rev-parse", "--verify", rev)
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 128:
+            return False
+        raise
+    return True
 
 
-def have_diverged(ref_a, ref_b):
-    rev_list_1 = run("rev-list", "--format=oneline", f"{ref_a}..{ref_b}")
-    rev_list_2 = run("rev-list", "--format=oneline", f"{ref_a}...{ref_b}")
+def checkout(*args):
+    run("checkout", *args)
+
+
+def have_diverged(rev_a, rev_b):
+    rev_list_1 = run("rev-list", "--format=oneline", f"{rev_a}..{rev_b}")
+    rev_list_2 = run("rev-list", "--format=oneline", f"{rev_a}...{rev_b}")
     return rev_list_1 != rev_list_2
 
 
@@ -58,8 +70,20 @@ class Pause(Exception):
 
 
 @contextmanager
+def temporary_branch():
+    head = get_head()
+    name = uuid.uuid4().hex
+    run("checkout", "-b", name)
+    try:
+        yield
+    finally:
+        checkout(head)
+        run("branch", "-D", name)
+
+
+@contextmanager
 def preserve_state(auto_stash=False):
-    result = run("status", "--porcelain")
+    result = run("status", "-u", "no", "--porcelain")
     work_tree_clean = not bool(result.strip())
     stash = False
     if auto_stash and not work_tree_clean:
@@ -68,7 +92,7 @@ def preserve_state(auto_stash=False):
         # Git interactive rebase message:
         # error: cannot rebase: You have unstaged changes.
         # error: Please commit or stash them.
-        raise Exception("work tree not clean")
+        raise click.ClickException("work tree not clean.")
     pause = False
     if stash:
         run("stash", "-u")

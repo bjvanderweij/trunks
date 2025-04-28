@@ -95,12 +95,51 @@ After saving and exiting, trunks will re-create the local ephemeral branches bas
 
 # Workflow example
 
+It's easy to make a mess in git. Sticking to a few basic rules may help keep your workflow simple and manageable.
+
+The golden rule: all work is done in serial commits on your local branch
+
+Trunks knows its place. The only operations it performs are the creation and deletion of trunks-managed branches, and cherry-picking commits into those branches.
+
+You are responsible for amending, rebasing, and squashing commits in your local trunk to shape it into a sequence of incremental and independent commits.
+Trunks is responsible for creating topic branches based on the plan you give it.
+
 Updating local commits:
 
-`git fetch`
-`git rebase -i origin/develop`
+`git pull --rebase <remote> UPSTREAM`
 
-Updating 
+Updating a specific commit:
+
+You could checkout the commit you want to update, make the changes, amend the commit, and rebase your local trunk on top of it. Usually I find it easier to commit 
+
+```bash
+# After making changes, run
+git commit -m "Fixup: ..."
+git rebase -i
+#  
+```
+
+* How to make edits from upstream develop
+* How to fixup a specific commit
+* How to time-travel to a commit / feature in order to test it or fix it?
+* Pull in new changes
+    `git pull --rebase <remote> UPSTREAM`
+
+
+Constraints:
+
+- If feature C does not depend on feature A it can be rebased and moved up to occur before feature A:
+    - This is illegal:
+        - C
+        - B@A
+        - A
+    - But you can use interactive rebase to do this:
+        - B@A
+        - A
+        - C
+
+
+
 
 # Epilogue
 
@@ -109,4 +148,5 @@ Trunks is meant to be **minimal** and only support actions that would be tedious
 The branches it creates are called ephemeral because will never need to (and perhaps never should) work directly on any of them. Instead, you can do all your work and make amendments only in your local trunk.
 
 This tool is intended for developers who don't need to be told how to re-order and slice and dice commits in their local history with git.
+
 
