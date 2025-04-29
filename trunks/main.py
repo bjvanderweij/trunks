@@ -123,13 +123,18 @@ class Commit(typing.NamedTuple):
         return cls(sha, " ".join(message_words))
 
     @property
+    def short_message(self):
+        return self.message.split('\n')[0]
+
+    @property
     def short_str(self):
-        return f"{self.sha[:8]} {self.message}"
+        return f"{self.sha[:8]} {self.short_message}"
 
     @property
     def branch_name(self):
         uniqueish = md5(self.message.encode()).hexdigest()[:8]
-        readable = "-".join(self.message.lower().split()[:4])
+        words = re.findall(r"\w+", self.message.lower())
+        readable = '-'.join(words)
         return BRANCH_TEMPLATE.format(f"{readable}-{uniqueish}")
 
 
@@ -165,6 +170,7 @@ class Branch(typing.NamedTuple):
     def create_instructions(self) -> str:
         return (
             f"git checkout {self.target_name}\n"
+            f"git checkout -b temporary-investigation-branch\n"
             f"git cherry-pick {' '.join([c.sha for c in self.commits])}"
         )
 
@@ -198,7 +204,7 @@ class Branch(typing.NamedTuple):
     def __str__(self):
         return (
             "Branch {self.name} with commits:"
-            "\n".join(f"\t{c.message}" for c in self.commits)
+            "\n".join(f"\t{c.short_message}" for c in self.commits)
         )
 
 
@@ -222,7 +228,7 @@ def make_simple_tree(stack) -> dict[str, Branch]:
     return tree
 
 
-def reconstruct_tree() -> dict[str, Branch]:
+def reconstruct_tree(use_branch_commits=False) -> dict[str, Branch]:
     """Use local commits to reconstruct the plan."""
     commits = get_local_commits()
     commits_by_message = {c.message: c for c in commits}
@@ -235,8 +241,10 @@ def reconstruct_tree() -> dict[str, Branch]:
                 raise click.ClickException(
                     "Invalid state: trunks-managed branch name "
                     f"{commit.branch_name} does not match branch name "
-                    "expected based on its last commit.\nIf you'd like to "
-                    "start with a clean slate, run `trunks reset`."
+                    "expected based on its last commit.\n\nRun\n\ngit branch "
+                    "-D {commit.branch_name}\n\nto remove the offending "
+                    "branch. Or run\n\ntrunks reset\n\nif you'd like to start "
+                    "with a clean slate."
                 )
             target_branch = None
             branch_commits: list[Commit] = []
@@ -246,9 +254,12 @@ def reconstruct_tree() -> dict[str, Branch]:
                     target_branch = tree[preceding_commit.branch_name]
                     break
                 elif preceding_commit.message in commits_by_message:
-                    branch_commits.insert(
-                        0, commits_by_message[preceding_commit.message]
-                    )
+                    if use_branch_commits:
+                        branch_commits.insert(0, preceding_commit)
+                    else:
+                        branch_commits.insert(
+                            0, commits_by_message[preceding_commit.message]
+                        )
                 else:
                     break
             branch = Branch(branch_commits, target_branch)
@@ -444,7 +455,7 @@ def generate_plan(tree: dict[str, Branch]) -> str:
             for branch in tree.values():
                 if m.group(2) == branch.name:
                     command = m.group(1) + "@b" + str(index_map[branch.name])
-        lines.append(f"{command} {commit.sha[:8]} {commit.message}")
+        lines.append(f"{command} {commit.sha[:8]} {commit.short_message}")
     return "\n".join(reversed(lines))
 
 
@@ -626,8 +637,8 @@ def show(verbose, visual):
     if verbose:
         click.echo(f"upstream: {UPSTREAM}")
         click.echo(f"local: {LOCAL}\n")
+    tree = reconstruct_tree()
     if visual:
-        tree = reconstruct_tree()
         dot = graphviz.Digraph()
         dot.node(UPSTREAM)
         for branch in tree.values():
@@ -637,7 +648,6 @@ def show(verbose, visual):
         with tempfile.NamedTemporaryFile() as f:
             dot.render(format="png", filename=f.name, view=True)
     else:
-        tree = reconstruct_tree()
         click.echo(generate_plan(tree))
 
 
@@ -661,7 +671,7 @@ def show(verbose, visual):
 @undiverged_trunks
 def plan(generator, edit, no_prune):
     """Create a plan and update local branches."""
-    old_tree = reconstruct_tree()
+    old_tree = reconstruct_tree(use_branch_commits=True)
     if generator == "stacked":
         tree = make_simple_tree(stack=True)
     elif generator == "independent":
@@ -669,7 +679,7 @@ def plan(generator, edit, no_prune):
     elif generator == "reset":
         tree = {}
     elif generator == "detect":
-        tree = old_tree
+        tree = reconstruct_tree()
     else:
         assert False, "You, the programmer, missed a case."
     plan = generate_plan(tree)
@@ -687,7 +697,7 @@ def plan(generator, edit, no_prune):
         if tree == old_tree:
             click.echo("No updates required.")
             return
-        update = click.confirm("Update branches accordingly?", default=True)
+        update = click.confirm("Update branches accordingly (N discards the plan)?", default=True)
         if update:
             _update(tree, no_prune)
     except (PlanError, ParsingError) as exc:
