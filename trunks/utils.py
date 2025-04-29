@@ -65,10 +65,6 @@ def get_current_branch():
     run("rev-parse", "--abbrev-ref", "HEAD")
 
 
-class Pause(Exception):
-    pass
-
-
 @contextmanager
 def temporary_branch():
     head = get_head()
@@ -82,31 +78,9 @@ def temporary_branch():
 
 
 @contextmanager
-def preserve_state(auto_stash=False):
-    result = run("status", "-u", "no", "--porcelain")
-    work_tree_clean = not bool(result.strip())
-    stash = False
-    if auto_stash and not work_tree_clean:
-        stash = True
-    elif not work_tree_clean and not auto_stash:
-        # Git interactive rebase message:
-        # error: cannot rebase: You have unstaged changes.
-        # error: Please commit or stash them.
-        raise click.ClickException("work tree not clean.")
-    pause = False
-    if stash:
-        run("stash", "-u")
+def return_to_head():
+    head = get_head()
     try:
-        head = get_head()
-        try:
-            yield
-        except Pause:
-            pause = True
+        yield
     finally:
-        if not pause:
-            checkout(head)
-            if stash:
-                run("stash", "pop")
-        else:
-            click.echo(f"git checkout {head}")
-            click.echo("git stash pop")
+        checkout(head)

@@ -31,13 +31,16 @@ import graphviz
 import click
 from trunks import utils
 
-UPSTREAM = "origin/develop"
-LOCAL = "bastiaan-develop"
+
+UPSTREAM = "origin/main"
+LOCAL = "main"
+# UPSTREAM = "origin/develop"
+# LOCAL = "bastiaan-develop"
 # UPSTREAM = "remote"
 # LOCAL = "local"
 BRANCH_TEMPLATE = "feature/{}"
 EDITOR = "vim"
-AUTO_STASH = False
+USE_FIRST_COMMIT_FOR_BRANCH_NAME = False
 
 
 INSTRUCTIONS = """
@@ -80,14 +83,12 @@ def undiverged_trunks(f):
     return wrapper
 
 
-def no_unstaged_changes(f):
+def clean_work_tree(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        result = utils.run("status", "--porcelain")
+        result = utils.run("status", "-u", "no", "--porcelain")
         if bool(result.strip()):
-            raise click.ClickException(
-                "you have unstaged changes, please commit or stash them"
-            )
+            raise click.ClickException("Work tree not clean.")
         return f(*args, **kwargs)
 
     return wrapper
@@ -228,7 +229,7 @@ def make_simple_tree(stack) -> dict[str, Branch]:
     return tree
 
 
-def reconstruct_tree(use_branch_commits=False) -> dict[str, Branch]:
+def reconstruct_tree() -> dict[str, Branch]:
     """Use local commits to reconstruct the plan."""
     commits = get_local_commits()
     commits_by_message = {c.message: c for c in commits}
@@ -254,12 +255,9 @@ def reconstruct_tree(use_branch_commits=False) -> dict[str, Branch]:
                     target_branch = tree[preceding_commit.branch_name]
                     break
                 elif preceding_commit.message in commits_by_message:
-                    if use_branch_commits:
-                        branch_commits.insert(0, preceding_commit)
-                    else:
-                        branch_commits.insert(
-                            0, commits_by_message[preceding_commit.message]
-                        )
+                    branch_commits.insert(
+                        0, commits_by_message[preceding_commit.message]
+                    )
                 else:
                     break
             branch = Branch(branch_commits, target_branch)
@@ -295,7 +293,7 @@ def create_or_update_branches(tree: dict[str, Branch]):
                 try:
                     utils.run("cherry-pick", "--abort")
                 except subprocess.CalledProcessError:
-                    click.echo("Failed to abort cherry-pick.")
+                    click.echo("Failed to abort cherry-pick.", err=True)
                 raise
             if branch.exists():
                 branch.delete()
@@ -520,25 +518,9 @@ def cli():
     try:
         cli_group()
     except subprocess.CalledProcessError as exc:
-        click.echo("subprocess failed:")
-        click.echo(exc)
-        click.echo("captured output:")
-        click.echo(exc.output)
-        click.echo(exc.stderr)
+        click.echo(f"Subprocess failed:\n{exc}\n", err=True)
+        click.echo(f"Captured output:\n{exc.output}\n{exc.stderr}\n", err=True)
         raise
-
-
-
-
-def update_options(f):
-    click.option(
-        "-n",
-        "--no-prune",
-        is_flag=True,
-        type=bool,
-        help="Do not prune trunks branches that are not in the plan anymore",
-    )(f)
-    return f
 
 
 @cli_group.command
@@ -590,34 +572,6 @@ def push(remote, soft, interactive, gitlab_merge_request):
 
 
 @cli_group.command
-@update_options
-@no_hot_branch
-def update(no_prune):
-    """Infer the plan from local branches and update the commits in the
-    branches.
-    """
-    tree = reconstruct_tree()
-    try:
-        _update(tree, no_prune)
-    except CherryPickFailed as exc:
-        raise click.ClickException(
-            f"{exc}\n\n"
-            f"To investigate, run:\n\n{exc.branch.create_instructions}."
-        )
-
-
-def _update(tree, no_prune):
-    with utils.preserve_state(auto_stash=AUTO_STASH):
-        create_or_update_branches(tree)
-        click.echo(
-            "Branches updated. "
-            "Run `trunks push` to push them to a remote."
-        )
-    if not no_prune:
-        prune_local_branches(tree)
-
-
-@cli_group.command
 @click.option(
     "-v",
     "--verbose",
@@ -652,12 +606,10 @@ def show(verbose, visual):
 
 
 @cli_group.command()
-@click.option(
-    "-g",
-    "--generator",
-    type=click.Choice(["detect", "stacked", "independent", "reset"]),
+@click.argument(
+    "strategy",
+    type=click.Choice(["detect", "stacked", "flat", "empty"]),
     default="detect",
-    help="Plan generation strategy."
 )
 @click.option(
     "-e",
@@ -666,22 +618,46 @@ def show(verbose, visual):
     type=bool,
     help="Edit the plan before executing it."
 )
-@update_options
+@click.option(
+    "-n",
+    "--no-prune",
+    is_flag=True,
+    type=bool,
+    help="Do not prune trunks branches that are not in the plan anymore",
+)
+@click.option(
+    '-y',
+    '--yes',
+    is_flag=True,
+    help="Do not ask for confirmation to apply plan."
+)
 @no_hot_branch
 @undiverged_trunks
-def plan(generator, edit, no_prune):
-    """Create a plan and update local branches."""
-    old_tree = reconstruct_tree(use_branch_commits=True)
-    if generator == "stacked":
+@clean_work_tree
+def plan(strategy, edit, no_prune, yes):
+    """Create a plan and update local branches.
+
+    The optional argument specifies the type of plan to generate. Available
+    types are:
+
+    \b
+    detect (default): use the last-applied plan
+    stacked: package each commit in a branch and make each branch depend on the
+             previous branch.
+    flat: package each commit in a separate independent branch
+    empty: generate an empty plan
+
+    """
+    if strategy == "stacked":
         tree = make_simple_tree(stack=True)
-    elif generator == "independent":
+    elif strategy == "flat":
         tree = make_simple_tree(stack=False)
-    elif generator == "reset":
+    elif strategy == "empty":
         tree = {}
-    elif generator == "detect":
+    elif strategy == "detect":
         tree = reconstruct_tree()
     else:
-        assert False, "You, the programmer, missed a case."
+        assert False, "You, programmer, missed a case."
     plan = generate_plan(tree)
     if edit:
         new_plan = edit_interactively(plan + INSTRUCTIONS)
@@ -694,12 +670,19 @@ def plan(generator, edit, no_prune):
     click.echo(f"The plan:\n\n{new_plan}\n")
     try:
         tree = parse_plan(new_plan)
-        if tree == old_tree:
-            click.echo("No updates required.")
-            return
-        update = click.confirm("Update branches accordingly (N discards the plan)?", default=True)
-        if update:
-            _update(tree, no_prune)
+        if not yes:
+            yes = click.confirm(
+                "Update branches accordingly ('n' discards the plan)?",
+                default=True
+            )
+        if yes:
+            with utils.return_to_head():
+                create_or_update_branches(tree)
+            click.echo(
+                "Branches updated. Run `trunks push` to push them to a remote."
+            )
+            if not no_prune:
+                prune_local_branches(tree)
     except (PlanError, ParsingError) as exc:
         raise click.ClickException(f"{exc}")
     except CherryPickFailed as exc:
@@ -750,8 +733,10 @@ def branches(commits: bool, show_targets: bool):
 
 @cli_group.command()
 @click.option(
+    '-y',
     '--yes',
     is_flag=True,
+    help="Do not ask for confirmation."
 )
 def reset(yes):
     """Remove trunks-managed branches."""
