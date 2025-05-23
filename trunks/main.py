@@ -41,6 +41,7 @@ LOCAL = "main"
 BRANCH_TEMPLATE = "feature/{}"
 EDITOR = "vim"
 USE_FIRST_COMMIT_FOR_BRANCH_NAME = False
+BRANCH_ANCHOR = "first"  # first/last
 
 
 INSTRUCTIONS = """
@@ -49,7 +50,7 @@ INSTRUCTIONS = """
 #
 # Commands:
 # b<label> <commit> = use commit in labeled branch
-# b<label>@b<target-label> <commit> = use commit in labeled branch from target-label
+# b<label>@b<target-label> <commit> = use commit in labeled branch off branch with target-label
 # s <commit> = do not use commit
 #
 # If you delete a line, the commit will not be used (equivalent to "s")
@@ -109,8 +110,8 @@ class ParsingError(Exception):
 
 
 class CherryPickFailed(Exception):
-    def __init__(self, *args, branch, **kwargs):
-        self.branch = branch
+    def __init__(self, *args, change_set, **kwargs):
+        self.change_set = change_set
 
 
 class Commit(typing.NamedTuple):
@@ -139,38 +140,41 @@ class Commit(typing.NamedTuple):
         return BRANCH_TEMPLATE.format(f"{readable}-{uniqueish}")
 
 
-class Branch(typing.NamedTuple):
+class ChangeSet(typing.NamedTuple):
     commits: list[Commit]
-    target: typing.Optional["Branch"]
+    target: typing.Optional["ChangeSet"]
 
     @property
-    def name(self):
-        return self.commits[-1].branch_name
+    def branch_name(self):
+        if BRANCH_ANCHOR == "first":
+            return self.commits[0].branch_name
+        else:
+            return self.commits[-1].branch_name
 
     @property
-    def full_name(self):
-        return f"refs/heads/{self.name}"
+    def full_branch_name(self):
+        return f"refs/heads/{self.branch_name}"
 
     @property
-    def target_name(self):
+    def target_branch_name(self) -> str:
         if self.target is None:
             return UPSTREAM
         else:
-            return self.target.name
+            return self.target.branch_name
 
-    def exists(self):
-        return utils.object_exists(self.full_name)
+    def branch_exists(self):
+        return utils.object_exists(self.full_branch_name)
 
-    def delete(self):
-        utils.run("branch", "-D", self.name)
+    def delete_branch(self):
+        utils.run("branch", "-D", self.branch_name)
 
-    def create(self):
-        utils.checkout("-b", self.name)
+    def create_branch(self):
+        utils.checkout("-b", self.branch_name)
 
     @property
     def create_instructions(self) -> str:
         return (
-            f"git checkout {self.target_name}\n"
+            f"git checkout {self.target_branch_name}\n"
             f"git checkout -b temporary-investigation-branch\n"
             f"git cherry-pick {' '.join([c.sha for c in self.commits])}"
         )
@@ -180,7 +184,8 @@ class Branch(typing.NamedTuple):
             utils.run("cherry-pick", *[c.sha for c in self.commits])
         except subprocess.CalledProcessError:
             raise CherryPickFailed(
-                f"Cherry-pick failed at branch {self.name}.", branch=self
+                f"Cherry-pick failed at branch {self.branch_name}.",
+                change_set=self
             )
 
     def get_force_push_command(
@@ -191,20 +196,20 @@ class Branch(typing.NamedTuple):
             "--force",
             "--set-upstream",
             remote,
-            f"{self.full_name}:{self.full_name}",
+            f"{self.full_branch_name}:{self.full_branch_name}",
         ]
         if gitlab_merge_request:
             command += ["--push-option", "merge_request.create"]
             if self.target is not None:
                 command += [
                     "--push-option",
-                    f"merge_request.target={self.target.name}",
+                    f"merge_request.target={self.target_branch_name}",
                 ]
         return command
 
     def __str__(self):
         return (
-            "Branch {self.name} with commits:"
+            "Branch {self.branch_name} with commits:"
             "\n".join(f"\t{c.short_message}" for c in self.commits)
         )
 
@@ -216,56 +221,131 @@ def get_trunks_branches():
     return [b for b in local_branches if b in branch_names]
 
 
-def make_simple_tree(stack) -> dict[str, Branch]:
+def make_simple_tree(stack) -> dict[str, ChangeSet]:
     """Use local commits create a tree of stacked branches."""
     commits = get_local_commits()
-    tree: dict[str, Branch] = {}
-    target_branch = None
+    tree: dict[str, ChangeSet] = {}
+    target = None
     for commit in commits:
-        branch = Branch([commit], target_branch)
-        tree[commit.branch_name] = branch
+        change_set = ChangeSet([commit], target)
+        tree[change_set.branch_name] = change_set
         if stack:
-            target_branch = branch
+            target = change_set
     return tree
 
 
-def reconstruct_tree() -> dict[str, Branch]:
-    """Use local commits to reconstruct the plan."""
+def infer_change_set_last_commit(commit, i, commits_by_message, tree, root) -> ChangeSet:
+    candidate_commits = get_last_n_commits(commit.branch_name, i + 1)
+    if candidate_commits[-1].branch_name != commit.branch_name:
+        raise click.ClickException(
+            "Invalid state: trunks-managed branch name "
+            f"{commit.branch_name} does not match branch name "
+            "expected based on its last commit.\n\nRun\n\ngit branch "
+            "-D {commit.branch_name}\n\nto remove the offending "
+            "branch. Or run\n\ntrunks reset\n\nif you'd like to start "
+            "with a clean slate."
+        )
+    target = None
+    commits: list[Commit] = []
+    # Find the first commit of the branch by iterating through
+    # preceding commits in reverse order
+    for cc in reversed(candidate_commits):
+        branch_name = cc.branch_name
+        # When finding a commit whose branch name corresponds to
+        # a branch in the tree and it isn't the current commits branch
+        # name assume we've found the target branch and stop
+        if branch_name in tree and branch_name != commit.branch_name:
+            target = tree[cc.branch_name]
+            break
+        # if we find a commit that is in the commits by message
+        elif cc.message in commits_by_message:
+            commits.insert(
+                0, commits_by_message[cc.message]
+            )
+        # either we've reached the bottom of the tree, in which case
+        # the preceding commits should be the same as the tip of
+        # remote. If not, a commit has been renamed
+        # No biggie, just print a warning
+        else:
+            if cc.message != root.message:
+                click.echo(
+                    f"warning: unknown commit message encountered: {cc.short_message}"
+                )
+            break
+    return ChangeSet(commits, target)
+
+
+def infer_change_set_first_commit(commit, i, commits_by_message, tree, root) -> ChangeSet:
+    n_local = len(commits_by_message)
+    candidate_commits = get_last_n_commits(commit.branch_name, n_local - i + 1)
+    target = None
+    branch_commits: list[Commit] = []
+    start_index = [c.branch_name for c in candidate_commits].index(
+        commit.branch_name
+    )
+    for change_set in tree.values():
+        if change_set.commits[-1].message == candidate_commits[start_index - 1].message:
+            target = change_set
+            break
+    for cc in candidate_commits[start_index:]:
+        if cc.message in commits_by_message:
+            branch_commits.append(commits_by_message[cc.message])
+        else:
+            click.echo(f"warning: unknown commit message encountered: {cc.message}")
+            break
+    return ChangeSet(branch_commits, target)
+
+
+def reconstruct_tree() -> dict[str, ChangeSet]:
+    """Use local commits to reconstruct the plan.
+
+    Assumes that the commits in local branches have the same commit messages
+    as commits in local commits.
+
+    Algorithm when branch name is derived from last commit:
+
+    get local commits in chronological order
+    get local branches
+    for commit in local commits
+    if branch name exists as local branch
+    get n preceding commits where n is index of commit in local commits
+    iterate in reverse chronological order until you encounter either
+    a commit corresponding to another branch already created or an unknown
+    commit.
+
+    when name is derived from first commit:
+
+    get local commits in chronological order
+    get local branches
+    for commit in local commits
+    if branch name exists as local branch
+    get commits in branch from tip (n_local_commits - index_of_current_commit)
+        until hitting epynomous commit. Then check if previous commit is known
+        as final commit of branch
+        If so, set corresponding branch as target
+        If not, preceding commit must be
+    record the final commit in the branch
+    """
     commits = get_local_commits()
     commits_by_message = {c.message: c for c in commits}
     local_branches = utils.get_local_branches()
-    tree: dict[str, Branch] = {}
+    root = get_last_upstream_commit()
+    tree: dict[str, ChangeSet] = {}
     for i, commit in enumerate(commits):
         if commit.branch_name in local_branches:
-            preceding_commits = get_last_n_commits(commit.branch_name, i)
-            if preceding_commits[-1].branch_name != commit.branch_name:
-                raise click.ClickException(
-                    "Invalid state: trunks-managed branch name "
-                    f"{commit.branch_name} does not match branch name "
-                    "expected based on its last commit.\n\nRun\n\ngit branch "
-                    "-D {commit.branch_name}\n\nto remove the offending "
-                    "branch. Or run\n\ntrunks reset\n\nif you'd like to start "
-                    "with a clean slate."
-                )
-            target_branch = None
-            branch_commits: list[Commit] = []
-            for preceding_commit in reversed(preceding_commits):
-                branch_name = preceding_commit.branch_name
-                if branch_name in tree and branch_name != commit.branch_name:
-                    target_branch = tree[preceding_commit.branch_name]
-                    break
-                elif preceding_commit.message in commits_by_message:
-                    branch_commits.insert(
-                        0, commits_by_message[preceding_commit.message]
-                    )
-                else:
-                    break
-            branch = Branch(branch_commits, target_branch)
-            tree[commit.branch_name] = branch
+            if BRANCH_ANCHOR == "first":
+                change_set = infer_change_set_first_commit(commit, i, commits_by_message, tree, root)
+            else:
+                change_set = infer_change_set_last_commit(commit, i, commits_by_message, tree, root)
+            tree[change_set.branch_name] = change_set
     return tree
 
 
-def create_or_update_branches(tree: dict[str, Branch]):
+def get_last_upstream_commit() -> Commit:
+    return get_commits(UPSTREAM)[0]
+
+
+def create_or_update_branches(tree: dict[str, ChangeSet]):
     """Create feature branches based on the plan in tree.
 
     Start at the roots of the tree and for each branch in the topologically
@@ -276,29 +356,29 @@ def create_or_update_branches(tree: dict[str, Branch]):
     only if the branch already existed and was re-created.
     """
     dag: dict[str, list[str]] = {}
-    for name, branch in tree.items():
+    for name, change_set in tree.items():
         if name not in dag:
             dag[name] = []
-        if branch.target is not None:
-            dag[name].append(branch.target.name)
+        if change_set.target is not None:
+            dag[name].append(change_set.target.branch_name)
     ts = TopologicalSorter(dag)
     updated = {}
     for branch_name in ts.static_order():
-        branch = tree[branch_name]
-        utils.checkout(branch.target_name)
+        change_set = tree[branch_name]
+        utils.checkout(change_set.target_branch_name)
         with utils.temporary_branch():
             try:
-                branch.cherry_pick()
+                change_set.cherry_pick()
             except CherryPickFailed:
                 try:
                     utils.run("cherry-pick", "--abort")
                 except subprocess.CalledProcessError:
                     click.echo("Failed to abort cherry-pick.", err=True)
                 raise
-            if branch.exists():
-                branch.delete()
+            if change_set.branch_exists():
+                change_set.delete_branch()
                 updated[branch_name] = True
-            branch.create()
+            change_set.create_branch()
             updated[branch_name] = False
     return updated
 
@@ -372,22 +452,21 @@ def _make_commit_lists(
 
 def _build_tree(
     candidate_branches: typing.Iterable[_CommitList],
-) -> dict[str, Branch]:
+) -> dict[str, ChangeSet]:
     """Parse branching plan and return a branch DAG.
 
-    This enforces constraints on the DAG that can be built:
+    Enforce the following constraints on the DAG:
 
-    - branches only point to either
+    - branches point to either
         - the target of the last branch
         - one of the set of immediately preceding branches with the same target
-    - because the order of commits must be preserved, commits in a branch
-      must appear in the same order as the local commits
+    - commits in a branch appear in the same order as the local commits
     """
-    branches: dict[str, Branch] = {}
+    change_sets: dict[str, ChangeSet] = {}
     last_target_label = None
     valid_target_labels: set[None | str] = {None}
     for cb in candidate_branches:
-        if cb.label in branches:
+        if cb.label in change_sets:
             raise PlanError("commits in branch must be contiguous")
         if cb.target_label not in valid_target_labels:
             raise PlanError(
@@ -395,66 +474,39 @@ def _build_tree(
             )
         target_branch = None
         if cb.target_label is not None:
-            target_branch = branches[cb.target_label]
+            target_branch = change_sets[cb.target_label]
         if cb.target_label != last_target_label:
             last_target_label = cb.target_label
             valid_target_labels = {last_target_label}
         valid_target_labels.add(cb.label)
-        branches[cb.label] = Branch(cb.commits, target_branch)
-    return {b.name: b for b in branches.values()}
+        change_sets[cb.label] = ChangeSet(cb.commits, target_branch)
+    return {b.branch_name: b for b in change_sets.values()}
 
 
-def parse_plan(plan: str) -> dict[str, Branch]:
+def parse_plan(plan: str) -> dict[str, ChangeSet]:
     tokens = _tokenize_plan(plan)
     commit_lists = _make_commit_lists(tokens)
     return _build_tree(commit_lists)
 
 
-def generate_plan(tree: dict[str, Branch]) -> str:
-    """Generate merging plan.
-
-    Use the commit messages of the local commits to derive branch names
-    and check if these branches exist. If they do, figure out what their
-    target branch is by walking backwards in the git log until a commit
-    is o
-
-    The plan is on the tree built from the current branches and contains
-    commits whose sha might differ from the one in the local commits,
-    but the commits in the plan correspond to those in the local commits.
-    """
-    current_branch = None
-    branch_index = len(tree)
-    index_map: dict[str, int] = {}
-    commands = []
+def render_plan(tree: dict[str, ChangeSet]) -> str:
     local_commits = get_local_commits()
-    for commit in reversed(local_commits):
-        new_current_branch = tree.get(commit.branch_name, None)
-        if new_current_branch is not None:
-            if (
-                current_branch is not None
-                and new_current_branch.name != current_branch.name
-            ):
-                branch_index -= 1
-                current_branch = new_current_branch
-            if current_branch is None:
-                current_branch = new_current_branch
-        command = "s"
-        if current_branch is not None:
-            if commit.message in [c.message for c in current_branch.commits]:
-                index_map[current_branch.name] = branch_index
-                command = f"b{branch_index}"
-                if current_branch.target is not None:
-                    command += f"@b{current_branch.target.name}"
-        commands.append(command)
+    sorted_change_sets = list(sorted(tree.values(), key=lambda cs: local_commits.index(cs.commits[0])))
     lines = []
-    for command, commit in zip(commands, reversed(local_commits)):
-        m = re.match(r"(b[0-9]+)@b(.*)$", command)
-        if m is not None:
-            for branch in tree.values():
-                if m.group(2) == branch.name:
-                    command = m.group(1) + "@b" + str(index_map[branch.name])
-        lines.append(f"{command} {commit.sha[:8]} {commit.short_message}")
-    return "\n".join(reversed(lines))
+    for commit in local_commits:
+        command = "s"
+        change_set = None
+        try:
+            cs_i, change_set = next((i, cs) for i, cs in enumerate(sorted_change_sets) if commit in cs.commits)
+        except StopIteration:
+            pass
+        if change_set is not None:
+            command = f"b{cs_i}"
+            if change_set.target is not None:
+                target_i = sorted_change_sets.index(change_set.target)
+                command += f"@b{target_i}"
+        lines.append(f"{command} {commit.short_str}")
+    return "\n".join(lines)
 
 
 def _get_hot_branches() -> set[str]:
@@ -471,27 +523,34 @@ def prune_local_branches(tree):
         utils.run("branch", "-D", branch_name)
 
 
-def get_commits(rev_a, rev_b):
-    """Return commits between rev_a and rev_b in chronological order."""
-    rev_list_output = utils.run(
+def get_commits_between(rev_a, rev_b) -> list[Commit]:
+    """Return commits from rev_a up to and including rev_b."""
+    return get_commits(f"{rev_a}..{rev_b}")
+
+
+def get_commits(commits: str, number: None | int = None) -> list[Commit]:
+    """Return commits chronological order."""
+    args = [
         "rev-list",
         "--no-merges",
         "--format=oneline",
-        f"{rev_a}..{rev_b}",
-        "--",
-    )
+        commits,
+    ]
+    if number is not None:
+        args += ["--max-count", str(number)]
+    rev_list_output = utils.run(*args, "--")
     rev_list = reversed(rev_list_output.strip().split("\n"))
     return [Commit.from_oneline(line) for line in rev_list if line]
 
 
 def get_last_n_commits(rev, n) -> list[Commit]:
-    """Return the n commits leading up to rev, including rev."""
-    return get_commits(f"{rev}~{n + 1}", rev)
+    """Return at most n commits leading up to rev, including rev."""
+    return get_commits(rev, number=n)
 
 
 def get_local_commits() -> list[Commit]:
     """Return all commits between upstream and local."""
-    commits = get_commits(UPSTREAM, LOCAL)
+    commits = get_commits_between(UPSTREAM, LOCAL)
     if len(commits) != len(set(c.message for c in commits)):
         raise click.ClickException("Local commit messages must be unique.")
     return commits
@@ -553,19 +612,19 @@ def cli():
 )
 def push(remote, soft, interactive, gitlab_merge_request):
     tree = reconstruct_tree()
-    for branch in tree.values():
-        push_command = branch.get_force_push_command(
+    for change_set in tree.values():
+        push_command = change_set.get_force_push_command(
             remote, gitlab_merge_request=gitlab_merge_request
         )
         do_it = True
         if interactive:
             do_it = click.confirm(
-                f"Push {branch.name} to {remote}?", default=True
+                f"Push {change_set.branch_name} to {remote}?", default=True
             )
         if soft:
             click.echo(f"git {' '.join(push_command)}")
         elif do_it:
-            click.echo(f"Pushing {branch.name}.")
+            click.echo(f"Pushing {change_set.branch_name}.")
             utils.run(*push_command)
     if not soft:
         click.echo("Done.")
@@ -595,14 +654,14 @@ def show(verbose, visual):
     if visual:
         dot = graphviz.Digraph()
         dot.node(UPSTREAM)
-        for branch in tree.values():
-            dot.node(branch.name)
-            target = UPSTREAM if branch.target is None else branch.target.name
-            dot.edge(branch.name, target)
+        for change_set in tree.values():
+            dot.node(change_set.branch_name)
+            target = UPSTREAM if change_set.target is None else change_set.target.branch_name
+            dot.edge(change_set.branch_name, target)
         with tempfile.NamedTemporaryFile() as f:
             dot.render(format="png", filename=f.name, view=True)
     else:
-        click.echo(generate_plan(tree))
+        click.echo(render_plan(tree))
 
 
 @cli_group.command()
@@ -658,7 +717,7 @@ def plan(strategy, edit, no_prune, yes):
         tree = reconstruct_tree()
     else:
         assert False, "You, programmer, missed a case."
-    plan = generate_plan(tree)
+    plan = render_plan(tree)
     if edit:
         new_plan = edit_interactively(plan + INSTRUCTIONS)
         new_plan = "\n".join(iterate_plan(new_plan))
@@ -688,7 +747,7 @@ def plan(strategy, edit, no_prune, yes):
     except CherryPickFailed as exc:
         raise click.ClickException(
             f"{exc} To reproduce the failed cherry-pick, run the following "
-            f"commands:\n\n{exc.branch.create_instructions}"
+            f"commands:\n\n{exc.change_set.create_instructions}"
         )
 
 
@@ -718,16 +777,16 @@ def branches(commits: bool, show_targets: bool):
         tree = reconstruct_tree()
     for branch_name in branches:
         if show_targets:
-            branch = tree[branch_name]
+            change_set = tree[branch_name]
             target = UPSTREAM
-            if branch.target is not None:
-                target = branch.target.name
+            if change_set.target is not None:
+                target = change_set.target_branch_name
             click.echo(f"{branch_name} --> {target}")
         else:
             click.echo(branch_name)
         if commits:
-            branch = tree[branch_name]
-            for commit in reversed(branch.commits):
+            change_set = tree[branch_name]
+            for commit in reversed(change_set.commits):
                 click.echo(f"\t{commit.sha[:8]} {commit.message}")
 
 
