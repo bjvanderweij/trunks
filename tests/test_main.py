@@ -1,6 +1,7 @@
 import tempfile
 import os
 import subprocess
+from click.testing import CliRunner
 from unittest.mock import patch
 from pathlib import Path
 from functools import partial
@@ -10,17 +11,27 @@ from trunks import utils
 from trunks.main import (
     ChangeSet, Commit, parse_plan, ParsingError, PlanError, UPSTREAM, LOCAL,
     reconstruct_tree, create_or_update_branches, get_local_commits, render_plan,
-    make_simple_tree
+    make_simple_tree, plan
 )
 
 
 @pytest.fixture()
-def git_repository():
-    with tempfile.TemporaryDirectory() as temp_dir:
-        new_run = partial(utils.run, cwd=temp_dir)
-        with patch("trunks.utils.run", new_run):
-            utils.run("init", cwd=temp_dir)
-            yield Path(temp_dir)
+def git_repository(tmp_path):
+    new_run = partial(utils.run, cwd=tmp_path)
+    with patch("trunks.utils.run", new_run):
+        utils.run("init", cwd=tmp_path)
+        yield Path(tmp_path)
+#
+#
+# @pytest.fixture()
+# def runner(git_repository, monkeypatch):
+#     monkeypatch.chdir(git_repository)
+#     return CliRunner()
+
+
+@pytest.fixture()
+def runner():
+    return CliRunner()
 
 
 @pytest.fixture()
@@ -100,6 +111,12 @@ def create_branch(git_repository):
     return _create_branch
 
 
+@pytest.fixture
+def checkout(git_repository):
+    def _checkout(name):
+        utils.run("checkout", name, cwd=git_repository)
+    return _checkout
+
 
 def test_parse_plan__syntax_errors(local_commits):
     with pytest.raises(ParsingError):
@@ -157,11 +174,11 @@ def test_parse_plan__legal_plans(local_commits):
     b = ChangeSet([a, c], None)
     tree = {b.branch_name: b}
     assert parse_plan("b 0 a\ns 1 foo\nb 2 v") == tree
-
-
-
-def test_render_plan():
-    pass
+    b = ChangeSet([a], None)
+    b1 = ChangeSet([b], None)
+    b2 = ChangeSet([c], dependencies=[a, b])
+    tree = {cs.branch_name: cs for cs in [b, b1, b2]}
+    assert parse_plan("b 0 a\nb1 1 foo\nb2@b,b1 2 v") == tree
 
 
 @pytest.fixture
@@ -323,6 +340,84 @@ def test_reconstruct_tree_independent(independent_commits, branch_anchor):
         }
 
 
+def test_plan__failed_cherry_pick(
+    runner, git_repository, commit, checkout, create_branch
+):
+    commit(dict(a="a"), "0")
+    create_branch(UPSTREAM)
+    commit(dict(a="b"), "1")
+    commit(dict(a="c"), "2")
+    create_branch(LOCAL)
+    result = runner.invoke(plan, ["flat", "-y"])
+    assert result.exit_code == 1
+    assert (
+        "Error: Cherry-pick failed"
+        in result.output
+    )
+
+
+def test_plan__duplicate_commit_names(
+    runner, git_repository, commit, checkout, create_branch
+):
+    commit(dict(a="a"), "0")
+    create_branch(UPSTREAM)
+    commit(dict(a="b"), "1")
+    commit(dict(a="c"), "1")
+    create_branch(LOCAL)
+    result = runner.invoke(plan)
+    assert result.exit_code == 1
+    assert (
+        "Error: Duplicate commit messages found in local commits."
+        in result.output
+    )
+
+
+def test_plan__diverged(
+    runner, git_repository, commit, checkout, create_branch
+):
+    commit(dict(a="a"), "0")
+    create_branch(LOCAL)
+    commit(dict(a="b"), "1")
+    create_branch(UPSTREAM)
+    result = runner.invoke(plan)
+    assert result.exit_code == 1
+    assert "Error: Your trunks have diverged." in result.output
+
+
+def test_plan__nonexistent_upstream(
+    runner, git_repository, commit, create_branch
+):
+    commit(dict(a="a"), "0")
+    create_branch(LOCAL)
+    result = runner.invoke(plan)
+    assert result.exit_code == 1
+    assert f"Error: Upstream {UPSTREAM} does not exist" in result.output
+
+
+def test_plan__nonexistent_local(
+    runner, git_repository, commit, create_branch
+):
+    commit(dict(a="a"), "0")
+    create_branch(UPSTREAM)
+    result = runner.invoke(plan)
+    assert result.exit_code == 1
+    assert f"Error: Local {LOCAL} does not exist" in result.output
+
+
+def test_plan__work_tree_not_clean(
+    runner, git_repository, commit, create_branch
+):
+    commit(dict(a="a"), "0")
+    create_branch(UPSTREAM)
+    commit(dict(a="aa"), "1")
+    create_branch(LOCAL)
+    with open(git_repository / "a", "w") as f:
+        f.write("ab")
+    result = runner.invoke(plan)
+    assert result.exit_code == 1
+    assert "Error: Work tree not clean." in result.output
+
+
 def test_reconstruct_tree_branch_label_first(commit, create_branch):
     commit(dict(a="a"), "0")
     create_branch(UPSTREAM)
@@ -351,22 +446,9 @@ def test_reconstruct_tree_branch_label_first(commit, create_branch):
     }
 
 
-# def test_reconstruct_tree():
-#     c0, c1, c2, c3, c4 = [Commit("0", "0"), Commit("1", "1"), Commit("2", "2"), Commit("3", "3"), Commit("4", "4")]
-#     local_commits = [c0, c1, c2, c3, c4]
-#     local_branches = [c1.branch_name, c4.branch_name, c5.branch_name]
-#     last_
-#     with patch.multiple(
-#         "trunks.main", 
-#         get_local_commits=Mock(return_value=local_commits),
-#         get_local_branches=Mock(return_value=local_branches),
-#         get_last_upstream_commit=[c0],
-#     ):
-#         tree = reconstruct_tree()
-#     assert tree == {}
-
-
-def test_build_empty_tree(commit_b, remote_trunk, commit_a, commit_c, local_trunk, git_repository):
+def test_build_empty_tree(
+    commit_b, remote_trunk, commit_a, commit_c, local_trunk, git_repository
+):
     tree = reconstruct_tree()
     assert tree == {}
 

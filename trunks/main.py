@@ -23,7 +23,6 @@ import typing
 import subprocess
 import tempfile
 import re
-import sys
 from hashlib import md5
 from graphlib import TopologicalSorter
 
@@ -32,10 +31,10 @@ import click
 from trunks import utils
 
 
-UPSTREAM = "origin/main"
-LOCAL = "main"
-# UPSTREAM = "origin/develop"
-# LOCAL = "bastiaan-develop"
+# UPSTREAM = "origin/main"
+# LOCAL = "main"
+UPSTREAM = "origin/develop"
+LOCAL = "bastiaan-develop"
 # UPSTREAM = "remote"
 # LOCAL = "local"
 BRANCH_TEMPLATE = "feature/{}"
@@ -76,9 +75,11 @@ def undiverged_trunks(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         if utils.have_diverged(UPSTREAM, LOCAL):
-            raise click.ClickException(
-                "your trunks have diverged, rebase local on your upstream"
+            click.echo(
+                f"Hint: Use `git pull --rebase {UPSTREAM}` to pull "
+                "upstream changes into your local branch."
             )
+            raise click.ClickException("Your trunks have diverged.")
         return f(*args, **kwargs)
 
     return wrapper
@@ -87,9 +88,21 @@ def undiverged_trunks(f):
 def clean_work_tree(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        result = utils.run("status", "-u", "no", "--porcelain")
+        result = utils.run("status", "--untracked-files=no", "--porcelain")
         if bool(result.strip()):
             raise click.ClickException("Work tree not clean.")
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
+def local_and_upstream_exist(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if not utils.object_exists(UPSTREAM):
+            raise click.ClickException(f"Upstream {UPSTREAM} does not exist")
+        if not utils.object_exists(LOCAL):
+            raise click.ClickException(f"Local {LOCAL} does not exist")
         return f(*args, **kwargs)
 
     return wrapper
@@ -548,11 +561,15 @@ def get_last_n_commits(rev, n) -> list[Commit]:
     return get_commits(rev, number=n)
 
 
+@local_and_upstream_exist
+@undiverged_trunks
 def get_local_commits() -> list[Commit]:
     """Return all commits between upstream and local."""
     commits = get_commits_between(UPSTREAM, LOCAL)
     if len(commits) != len(set(c.message for c in commits)):
-        raise click.ClickException("Local commit messages must be unique.")
+        raise click.ClickException(
+            "Duplicate commit messages found in local commits."
+        )
     return commits
 
 
@@ -567,10 +584,7 @@ def edit_interactively(contents: str) -> str:
 
 @click.group()
 def cli_group():
-    if not utils.object_exists(UPSTREAM):
-        raise click.ClickException(f"Upstream {UPSTREAM} does not exist")
-    if not utils.object_exists(LOCAL):
-        raise click.ClickException(f"Local {LOCAL} does not exist")
+    pass
 
 
 def cli():
@@ -663,7 +677,6 @@ def show(verbose, visual):
     else:
         click.echo(render_plan(tree))
 
-
 @cli_group.command()
 @click.argument(
     "strategy",
@@ -691,7 +704,6 @@ def show(verbose, visual):
     help="Do not ask for confirmation to apply plan."
 )
 @no_hot_branch
-@undiverged_trunks
 @clean_work_tree
 def plan(strategy, edit, no_prune, yes):
     """Create a plan and update local branches.

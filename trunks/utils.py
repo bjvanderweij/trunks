@@ -19,7 +19,8 @@ def run(*git_action: str, cwd=None):
     except subprocess.CalledProcessError as exc:
         print(f"subprocess exited with error: {exc.stderr}.")
         raise
-    # print(result.stdout.decode())
+    print(result.stdout.decode())
+    print(result.stderr.decode())
     return result.stdout.decode("utf-8")
 
 
