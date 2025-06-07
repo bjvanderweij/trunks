@@ -23,6 +23,8 @@ import typing
 import subprocess
 import tempfile
 import re
+import configparser
+from pathlib import Path
 from hashlib import md5
 from graphlib import TopologicalSorter
 
@@ -31,16 +33,31 @@ import click
 from trunks import utils
 
 
-# UPSTREAM = "origin/main"
-# LOCAL = "main"
-UPSTREAM = "origin/develop"
-LOCAL = "bastiaan-develop"
-# UPSTREAM = "remote"
-# LOCAL = "local"
-BRANCH_TEMPLATE = "feature/{}"
-EDITOR = "vim"
-USE_FIRST_COMMIT_FOR_BRANCH_NAME = False
-BRANCH_ANCHOR = "first"  # first/last
+def get_config():
+    paths = [
+        Path(".trunks"),
+        Path("~/.trunks").expanduser(),
+    ]
+    config = configparser.ConfigParser()
+    config["trunks"] = {
+        "upstream": "origin/main",
+        "local": "main",
+        "remote": "origin",
+        "branch-anchor": "first",  # first/last
+        "branch-template": "feature/{}",
+        "editor": "vim",
+    }
+    config.read(paths)
+    return config
+
+
+CONFIG = get_config()
+UPSTREAM = CONFIG["trunks"]["upstream"]
+LOCAL = CONFIG["trunks"]["local"]
+BRANCH_TEMPLATE = CONFIG["trunks"]["branch-template"]
+EDITOR = CONFIG["trunks"]["editor"]
+BRANCH_ANCHOR = CONFIG["trunks"]["branch-anchor"]
+REMOTE = CONFIG["trunks"]["remote"]
 
 
 INSTRUCTIONS = """
@@ -48,6 +65,8 @@ INSTRUCTIONS = """
 # Edit branch-creation plan.
 #
 # Commands:
+# u = use commit in single-commit branch
+# u@b<target-label> <commit> = use commit in single-commit branch off branch with target-label
 # b<label> <commit> = use commit in labeled branch
 # b<label>@b<target-label> <commit> = use commit in labeled branch off branch with target-label
 # s <commit> = do not use commit
@@ -108,23 +127,27 @@ def local_and_upstream_exist(f):
     return wrapper
 
 
-class TrunksDiverged(Exception):
-    """Raise if local and upstream have diverged."""
+class TrunksException(Exception):
+    def __init__(self, *args, hints: None | list[str] = None, **kwargs):
+        self.hints = hints
+        super().__init__(*args, **kwargs)
 
+    def emit_hints(self):
+        if self.hints is not None:
+            for hint in self.hints:
+                click.echo(f"Hint: {hint}")
+
+
+class ParsingError(TrunksException):
     pass
 
 
-class PlanError(Exception):
+class PlanError(TrunksException):
     pass
 
 
-class ParsingError(Exception):
+class CherryPickFailed(TrunksException):
     pass
-
-
-class CherryPickFailed(Exception):
-    def __init__(self, *args, change_set, **kwargs):
-        self.change_set = change_set
 
 
 class Commit(typing.NamedTuple):
@@ -196,9 +219,13 @@ class ChangeSet(typing.NamedTuple):
         try:
             utils.run("cherry-pick", *[c.sha for c in self.commits])
         except subprocess.CalledProcessError:
+            hint = (
+                f"To reproduce the failed cherry-pick, run the following "
+                f"commands:\n\n{self.create_instructions}"
+            )
             raise CherryPickFailed(
                 f"Cherry-pick failed at branch {self.branch_name}.",
-                change_set=self
+                hints=[hint]
             )
 
     def get_force_push_command(
@@ -234,7 +261,7 @@ def get_trunks_branches():
     return [b for b in local_branches if b in branch_names]
 
 
-def make_simple_tree(stack) -> dict[str, ChangeSet]:
+def build_tree(stack: bool = True) -> dict[str, ChangeSet]:
     """Use local commits create a tree of stacked branches."""
     commits = get_local_commits()
     tree: dict[str, ChangeSet] = {}
@@ -448,9 +475,7 @@ def _make_commit_lists(
                 c for c in local_commits if c.sha.startswith(bc.commit_sha)
             )
         except StopIteration:
-            raise PlanError(
-                "commits are not ordered correctly or unrecognized commit"
-            )
+            raise PlanError("cannot match commits in plan to local commits")
         branches[-1].commits.append(commit)
         if bc.target_label is not None:
             if branches[-1].target_label is None:
@@ -478,21 +503,24 @@ def _build_tree(
     change_sets: dict[str, ChangeSet] = {}
     last_target_label = None
     valid_target_labels: set[None | str] = {None}
-    for cb in candidate_branches:
-        if cb.label in change_sets:
-            raise PlanError("commits in branch must be contiguous")
-        if cb.target_label not in valid_target_labels:
+    for cs in candidate_branches:
+        if cs.target_label not in valid_target_labels:
+            hints = [
+                "re-order commits with "
+                f"`git rebase --interactive {LOCAL} {UPSTREAM}`"
+            ]
             raise PlanError(
-                f"invalid target for {cb.label}: {cb.target_label}"
+                f"invalid target for {cs.label}: {cs.target_label}",
+                hints=hints
             )
         target_branch = None
-        if cb.target_label is not None:
-            target_branch = change_sets[cb.target_label]
-        if cb.target_label != last_target_label:
-            last_target_label = cb.target_label
+        if cs.target_label is not None:
+            target_branch = change_sets[cs.target_label]
+        if cs.target_label != last_target_label:
+            last_target_label = cs.target_label
             valid_target_labels = {last_target_label}
-        valid_target_labels.add(cb.label)
-        change_sets[cb.label] = ChangeSet(cb.commits, target_branch)
+        valid_target_labels.add(cs.label)
+        change_sets[cs.label] = ChangeSet(cs.commits, target_branch)
     return {b.branch_name: b for b in change_sets.values()}
 
 
@@ -600,7 +628,7 @@ def cli():
 @click.argument(
     "remote",
     nargs=1,
-    default="origin",
+    default=REMOTE,
     type=str,
 )
 @click.option(
@@ -639,7 +667,8 @@ def push(remote, soft, interactive, gitlab_merge_request):
             click.echo(f"git {' '.join(push_command)}")
         elif do_it:
             click.echo(f"Pushing {change_set.branch_name}.")
-            utils.run(*push_command)
+            output = utils.run(*push_command)
+            click.echo(output)
     if not soft:
         click.echo("Done.")
 
@@ -676,6 +705,7 @@ def show(verbose, visual):
             dot.render(format="png", filename=f.name, view=True)
     else:
         click.echo(render_plan(tree))
+
 
 @cli_group.command()
 @click.argument(
@@ -720,9 +750,9 @@ def plan(strategy, edit, no_prune, yes):
 
     """
     if strategy == "stacked":
-        tree = make_simple_tree(stack=True)
+        tree = build_tree(stack=True)
     elif strategy == "flat":
-        tree = make_simple_tree(stack=False)
+        tree = build_tree(stack=False)
     elif strategy == "empty":
         tree = {}
     elif strategy == "detect":
@@ -738,12 +768,12 @@ def plan(strategy, edit, no_prune, yes):
             return
     else:
         new_plan = plan
-    click.echo(f"The plan:\n\n{new_plan}\n")
+    click.echo(f"{new_plan}\n")
     try:
         tree = parse_plan(new_plan)
         if not yes:
             yes = click.confirm(
-                "Update branches accordingly ('n' discards the plan)?",
+                "Update branches according to this plan? ('n' discards the plan)",
                 default=True
             )
         if yes:
@@ -754,13 +784,11 @@ def plan(strategy, edit, no_prune, yes):
             )
             if not no_prune:
                 prune_local_branches(tree)
-    except (PlanError, ParsingError) as exc:
-        raise click.ClickException(f"{exc}")
-    except CherryPickFailed as exc:
-        raise click.ClickException(
-            f"{exc} To reproduce the failed cherry-pick, run the following "
-            f"commands:\n\n{exc.change_set.create_instructions}"
-        )
+    except ParsingError as exc:
+        raise click.ClickException(str(exc))
+    except (PlanError, CherryPickFailed) as exc:
+        exc.emit_hints()
+        raise click.ClickException(str(exc))
 
 
 @cli_group.command()

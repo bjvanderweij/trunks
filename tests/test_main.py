@@ -128,13 +128,13 @@ def test_parse_plan__syntax_errors(local_commits):
 
 
 def test_parse_plan__illegal_plans(local_commits):
-    with pytest.raises(PlanError, match="unrecognized"):
+    with pytest.raises(PlanError, match="cannot match"):
         # Unrecognized commit
         parse_plan("s 0 a\nb1 a\ns 2 v") == {}
-    with pytest.raises(PlanError, match="unrecognized"):
+    with pytest.raises(PlanError, match="cannot match"):
         # Out of order commits
         parse_plan("b 1 a\nb 0 foo") == {}
-    with pytest.raises(PlanError, match="must be contiguous"):
+    with pytest.raises(PlanError, match="invalid target"):
         # Non contiguous commits in branch
         parse_plan("b 0 a\nb1@b 1 foo\nb  2 v") == {}
     with pytest.raises(PlanError, match="invalid target"):

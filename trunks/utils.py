@@ -12,15 +12,15 @@ class CalledProcessError(subprocess.CalledProcessError):
 def run(*git_action: str, cwd=None):
     # print(" ".join(git_action))
     try:
-        print(" ".join(git_action))
+        # print(" ".join(git_action))
         result = subprocess.run(
             ["git", *git_action], check=True, capture_output=True, cwd=cwd
         )
     except subprocess.CalledProcessError as exc:
-        print(f"subprocess exited with error: {exc.stderr}.")
+        # print(f"subprocess exited with error: {exc.stderr}.")
         raise
-    print(result.stdout.decode())
-    print(result.stderr.decode())
+    # print(result.stdout.decode())
+    # print(result.stderr.decode())
     return result.stdout.decode("utf-8")
 
 

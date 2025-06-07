@@ -1,152 +1,124 @@
 # Trunks
 
-Trunks helps you manage a set of ephemeral branches for merging features you're working on using a stacked-diffs approach.
+Trunks helps you integrate a stacked-diffs style workflow into environments that use pull requests.
 
-Imagine you are working on several small tweaks and a few bigger related and possibly dependent change-sets. Your commit history looks like this:
+Trunks tries to practice minimalism: it does not aim to replace git and only steps in where using just git would be tedious.
 
-```
-       main --> c5 Support new workload type
-                c4 Improve work distribution algorithm
-                c3 Add max memory property to Worker class
-                c2 Increase worker threads
-origin/main --> c1 Fix race condition in scheduler
-```
+## How to use it
 
-You have a few *local commits* to `main`, your *local trunk*, which is ahead of `origin/main`, your *remote trunk*.
+Trunks was designed with a specific workflow in mind.
 
-Two commits, `c2` and `c3` are self-contained changesets that can be merged independently, but `c4` depends on `c2` and `c5` depends on `c4`. In order words, we could create two pull requests into `main` containing commits `c2` and `c3` respectively, one pull request containing `c4` into the branch containing `c2` and one pull request with `c5` into the branch containing `c4`.
+The core idea of this workflow is to do all work on a single, *local* branch that is ahead of an *upstream* branch.
+The upstream branch can for example be `origin/main` while your local branch is `main`.
+Instead of working on `main` you could also create a personal "work-in-progress" branch.
+That might be useful if you want to push your work to a remote from time to time.
 
-## Creating a plan
+You develop features in one or more *local commits* on your local branch.
+Periodically, you request review for one or more of these commits by creating temporary branches
+When approved, they are integrated into the *upstream* by doing a fast-forward merge.
 
-Trunks lets you enter this information into a *plan* based on which it creates a tree of ephemeral branches off `main` that support the pull requests described above.
-
-Invoking `trunk edit` at this point will open an editor showing your local commits and the current plan:
+You can rebase your local branch on your *upstream* branch by running:
 
 ```
-s c2 Increase worker threads
-s c3 Add max memory property to Worker class
-s c4 Improve work distribution algorithm
-s c5 Support new workload type
+git pull --rebase origin/main
 ```
 
-This default plan will not do anything because it instructs trunks to skip (`s`) every commit.
+This will integrate the commits that have been approved and integrated into `origin/main` along with work by your team-mates into your local `main`.
 
-To instruct trunks to create the branching structure described above we use the `b` instruction coupled with an optional numeric label and target branch:
+You are largely completely free in how organize your work in local commits.
+Local commits could, but don't have to, correspond to individual features. 
+Since they are local, you can also freely amend and re-order these commits with `git rebase`.
 
-```
-b     c2 Increase worker threads
-b1    c3 Add max memory property to Worker class
-b2@b1 c4 Improve work distribution algorithm
-b3@b2 c5 Support new workload type
-```
+The part of this that is tedious is managing and updating temporary branches from which integration requests (pull requests or merge requests) are created.
+This is where trunks comes into play.
 
-This will create four branches with the following dependencies:
+Suppose that you have the following commits.
 
 ```
-main <---- b <-- b2 <-- b3
-       `-- b1
+c0 initial commit
+c1 update readme <-- origin/main
+c2 feature 1
+c3 feature 2 (work in progress)
+c4 feature 3 <--- main
 ```
 
-## Updating the plan
-
-After submitting your pull requests for review you will likely have to make a few amendments to your work. It is not necessary to switch branches in order to make these changes. You can work on your local trunk and freely use git (interactive) rebases to incorporate your changes into existing commits.
-
-Additionally, you may want to fetch main and rebase your local commits on top of the work of others.
-
-Imagine that after updating your local work and fetching and rebasing your local branch, it looks like this:
+Suppose that we want to publish "feature 1" and "feature 2".
+We can create an "integration plan" with
 
 ```
-       main --> c7 Support new workload type
-                c6 Improve workload distribution algorithm
-                c5 Add max memory property to Worker class
-                c4 Address reviewer comments                 # new local commit
-                c3 Increase worker threads
-origin/main --> c2 Increase scheduler performance            # updated remote main branch
-                c1 Fix race condition in scheduler
+trunks plan -e
 ```
 
-Since you have rebased, you will need to update your pull requests. Doing this manually with git would require going into each branch, rebasing it against its target branch and replacing the commits you want to have reviewed (e.g., with a combination of `git reset --hard` and `git cherry-pick`).
-
-Trunks automates this. Run `trunks update` to delete and recreate your local ephemeral branches based on the plan.
-
-Trunks remembers the plan, even though due to rebasing, the commit SHAs may have changed. Trunks uses the commit message of the last commit in a branch to match branches to your local commits. As long as these don't change, trunks will recognize them and be able to reconstruct the plan.
-
-This will update (in fact, delete and recreate) the ephemeral branches, but will not include the new commit, `c4` in the merge request for `c3`. To do that, we can edit the plan again with `trunks edit`. It now show up as follows:
+The `-e` flag causes an editor to launch showing our local commits.
 
 ```
-b     c3 Increase worker threads
-s     c4 Address reviewer comments
-b1    c5 Add max memory property to Worker class
-b2@b1 c6 Improve work distribution algorithm
-b3@b2 c7 Support new workload type
+s c2 feature 1
+s c3 feature 2
+s c4 feature 3 (work in progress)
 ```
 
-To include `c6` in `b`, simply change its `s` into `b`:
+This can be read as a sequence of instructions representing an "integration plan". This editor-based interface is inspired by the `git rebase --interactive` command. The "s" command means skip or do not use this commit. To publish a commit for review, change "s" into a "b", optionally followed by a numeric label.
 
 ```
-b     c3 Increase worker threads
-b     c4 Address reviewer comments
-b1    c5 Add max memory property to Worker class
-b2@b1 c6 Improve work distribution algorithm
-b3@b2 c7 Support new workload type
+b0 c2 feature 1
+b1 c3 feature 2
+s c4 feature 3 (work in progress)
 ```
 
-After saving and exiting, trunks will re-create the local ephemeral branches based on the amended plan.
+After saving and closing, trunks asks you to confirm that you want to create branches based on this plan.
 
-# Workflow example
+After doing so, it will create two feature branches both starting from your upstream branch (origin/main).
+The names of these branches are based on the commit message of the first (or last - this is configurable) commit of the feature.
 
-It's easy to make a mess in git. Sticking to a few basic rules may help keep your workflow simple and manageable.
+Finally, publish your changes with `trunks push`. This force-pushes each of branches trunks created to your remote.
+Optionally, you can create integration requests with the `-m` flag. This currently only works for Gitlab.
 
-The golden rule: all work is done in serial commits on your local branch
+Trunks will remember your integration plan. The next time you run `turnks plan`, trunks recovers the integration plan based on the branches it created and the commits messages of your local commits.
 
-Trunks knows its place. The only operations it performs are the creation and deletion of trunks-managed branches, and cherry-picking commits into those branches.
+### Multiple commits in a feature
 
-You are responsible for amending, rebasing, and squashing commits in your local trunk to shape it into a sequence of incremental and independent commits.
-Trunks is responsible for creating topic branches based on the plan you give it.
+You're not limited to creating integration requests that consists of single commits (although it [may not be a bad idea to do so](https://jg.gg/2018/09/29/stacked-diffs-versus-pull-requests/)). For example, the plan below bundles feature 1 and feature 2 in a single integration request.
 
-Updating local commits:
-
-`git pull --rebase <remote> UPSTREAM`
-
-Updating a specific commit:
-
-You could checkout the commit you want to update, make the changes, amend the commit, and rebase your local trunk on top of it. Usually I find it easier to commit 
-
-```bash
-# After making changes, run
-git commit -m "Fixup: ..."
-git rebase -i
-#  
+```
+b c2 feature 1
+b c3 feature 2
+s c4 feature 3
 ```
 
-* How to make edits from upstream develop
-* How to fixup a specific commit
-* How to time-travel to a commit / feature in order to test it or fix it?
-* Pull in new changes
-    `git pull --rebase <remote> UPSTREAM`
+This plan creates a single feature branch containing `c2` and `c3`.
 
+### Complex dependencies
 
-Constraints:
+Often, some but not all of your features might depend on each other. Trunks lets you specify more complex dependency relations between features. For example, in a "stacked diffs" workflow, you stack multiple diffs on top of each other and create integration requests.
 
-- If feature C does not depend on feature A it can be rebased and moved up to occur before feature A:
-    - This is illegal:
-        - C
-        - B@A
-        - A
-    - But you can use interactive rebase to do this:
-        - B@A
-        - A
-        - C
+Use `trunks plan stack` to create a stack of integration request where each integration request depends on the previous one.
 
+```
+b0 c2 feature 1
+b1@b0 c3 feature 2
+b2@b1 c4 feature 3
+```
 
+The syntax "b1@b0" means: create a feature b1 that depends on b0. It will result in a feature branch
 
+However more complex dependency relationships are also possible. It might be that feature 2 and feature 3 are independent features that can both require b0 to be integrated first.
+The plan below represents this situation.
 
-# Epilogue
+```
+b0 c2 feature 1
+b1@b0 c3 feature 2
+b2@b0 c4 feature 3
+```
 
-Trunks is meant to be **minimal** and only support actions that would be tedious to do manually in `git`. It attempts to **follow established idioms** in git such as editing instructions for a sequence of actions to be performed in a plain-text file in the same way interactive rebases work in git. Finally, trunks is **stateless** in the sense that trunks stores all information it needs to persist in git branch names.
+## How it works
 
-The branches it creates are called ephemeral because will never need to (and perhaps never should) work directly on any of them. Instead, you can do all your work and make amendments only in your local trunk.
+Trunks is careful never to touch your local branch or commits.
+Instead, it creates ephemeral feature branches and cherry-picks the relevant commits into them.
+These trunks-managed branches are the only git objects that trunks writes to.
+They are ephemeral because are deleted and recreated each time you save an integration plan.
+As such, you should never do any work on directly on these branches.
 
-This tool is intended for developers who don't need to be told how to re-order and slice and dice commits in their local history with git.
+The feature branches are named in a way that makes it unlikely for them to name-clash with other branches.
+This is imporant because they are often force-pushed to your origin.
 
-
+Trunks remembers your dependency tree, but does not store any state directly in files. Its "memory" is encoded entirely in the *commit messages* of your local commits and the *branch names* of the branches that trunks creates. If you amend the commit message of local commits, trunks will not remember what feature they belong to. Trunks will complain there is a duplicate commit message among your local commits.
