@@ -1,10 +1,18 @@
-# Trunks
+# diffqueue
 
-Trunks helps you integrate a stacked-diffs style workflow into environments that use pull requests.
+Trunks helps you work on several inter-dependent features at once and request review independently.
+
+It supports combining a stacked-diffs style workflows with submitting regular Gitlab/Github-style merge-/pull-requests.
 
 Trunks tries to practice minimalism: it does not aim to replace git and only steps in where using just git would be tedious.
 
+## What does it do?
+
+
+
 ## How to use it
+
+## Workflow
 
 Trunks was designed with a specific workflow in mind.
 
@@ -25,7 +33,7 @@ git pull --rebase origin/main
 
 This will integrate the commits that have been approved and integrated into `origin/main` along with work by your team-mates into your local `main`.
 
-You are largely completely free in how organize your work in local commits.
+You are largely free in how organize your work in local commits.
 Local commits could, but don't have to, correspond to individual features. 
 Since they are local, you can also freely amend and re-order these commits with `git rebase`.
 

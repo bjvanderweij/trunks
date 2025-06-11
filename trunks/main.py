@@ -1,23 +1,3 @@
-"""Tool for managing a stacked diffs workflow.
-
-Concepts:
-
-Upstream
-Local
-Difference between local and upstream.
-
-Configuration files:
-
-    global ~/.trunksrc
-    repo .trunksrc
-
-Configuration options:
-
-    upstream
-    local
-    branch-template
-"""
-
 import functools
 import typing
 import subprocess
@@ -34,8 +14,9 @@ from trunks import utils
 
 
 def get_config():
+    root_path = utils.run("rev-parse", "--show-toplevel").strip()
     paths = [
-        Path(".trunks"),
+        Path(root_path) / ".trunks",
         Path("~/.trunks").expanduser(),
     ]
     config = configparser.ConfigParser()

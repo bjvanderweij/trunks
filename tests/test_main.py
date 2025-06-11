@@ -340,6 +340,15 @@ def test_reconstruct_tree_independent(independent_commits, branch_anchor):
         }
 
 
+def test_plan__not_a_git_repo(runner):
+    result = runner.invoke(plan)
+    assert result.exit_code == 1
+    assert (
+        "Error: Not a git repository"
+        in result.output
+    )
+
+
 def test_plan__failed_cherry_pick(
     runner, git_repository, commit, checkout, create_branch
 ):
